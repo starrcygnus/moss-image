@@ -275,6 +275,55 @@ def build_workflow(p):
     ks["sampler_name"] = p.get("sampler") or DEFAULTS["sampler"]
     ks["scheduler"] = p.get("scheduler") or DEFAULTS["scheduler"]
 
+    wf["19"]["inputs"]["aspect_ratio"] = p.get("aspect_ratio") or DEFAULTS["aspect_ratio"]
+    wf["19"]["inputs"]["megapixels"] = clamp(p.get("megapixels"), 0.25, 4, float, 1.0)
+    wf["18:16"]["inputs"]["switch"] = bool(p.get("upsampler", DEFAULTS["upsampler"]))
+    wf["18:24"]["inputs"]["switch"] = bool(p.get("slg", DEFAULTS["slg"]))
+    wf["18:11"]["inputs"]["sampling_mode.seed"] = seed
+    wf["18:1"]["inputs"]["unet_name"] = p.get("checkpoint") or DEFAULTS["checkpoint"]
+
+    curr_model = ["18:1", 0]
+    curr_clip = ["18:2", 0]
+
+    l1_name = p.get("lora1", "None")
+    l1_str = float(p.get("lora1_strength", 1.0))
+    is_turbo = "8-step" in (str(l1_name) + str(p.get("lora2", "")) + str(p.get("lora3", ""))).lower()
+    # Turbo LoRA Protection: 8-step DMD LoRA requires CFG <= 1.5 and SLG off to avoid NaN latent explosion
+    if is_turbo:
+        if ks["cfg"] > 1.5:
+            ks["cfg"] = 1.0
+        wf["18:24"]["inputs"]["switch"] = False
+    if l1_name and l1_name != "None" and l1_str != 0:
+        wf["lora_1"] = {
+            "inputs": {"lora_name": l1_name, "strength_model": l1_str, "strength_clip": l1_str, "model": curr_model, "clip": curr_clip},
+            "class_type": "LoraLoader",
+            "_meta": {"title": f"LoRA 1 ({l1_name})"}
+        }
+        curr_model = ["lora_1", 0]
+        curr_clip = ["lora_1", 1]
+
+    l2_name = p.get("lora2", "None")
+    l2_str = float(p.get("lora2_strength", 1.0))
+    if l2_name and l2_name != "None" and l2_str != 0:
+        wf["lora_2"] = {
+            "inputs": {"lora_name": l2_name, "strength_model": l2_str, "strength_clip": l2_str, "model": curr_model, "clip": curr_clip},
+            "class_type": "LoraLoader",
+            "_meta": {"title": f"LoRA 2 ({l2_name})"}
+        }
+        curr_model = ["lora_2", 0]
+        curr_clip = ["lora_2", 1]
+
+    l3_name = p.get("lora3", "None")
+    l3_str = float(p.get("lora3_strength", 1.0))
+    if l3_name and l3_name != "None" and l3_str != 0:
+        wf["lora_3"] = {
+            "inputs": {"lora_name": l3_name, "strength_model": l3_str, "strength_clip": l3_str, "model": curr_model, "clip": curr_clip},
+            "class_type": "LoraLoader",
+            "_meta": {"title": f"LoRA 3 ({l3_name})"}
+        }
+        curr_model = ["lora_3", 0]
+        curr_clip = ["lora_3", 1]
+
     # Routing between Text-to-Image, Classic Img2Img, and Control LoRA
     active_tab = p.get("tab", "gen")
     input_img = (p.get("input_image") or "").strip()
@@ -392,7 +441,7 @@ def build_workflow(p):
         ks["denoise"] = 1.0
         ks["positive"] = ["ctrl_encode_pos", 0]
         ks["negative"] = ["ctrl_encode_neg", 0]
-        if "cfg" not in p or p.get("cfg") == DEFAULTS["cfg"]:
+        if not is_turbo and ("cfg" not in p or p.get("cfg") == DEFAULTS["cfg"]):
             ks["cfg"] = 4.0
 
     elif active_tab == "img2img" and input_img:
@@ -414,54 +463,6 @@ def build_workflow(p):
         # Pure Text-to-Image Mode
         ks["latent_image"] = ["18:6", 0]
         ks["denoise"] = 1.0
-
-    wf["19"]["inputs"]["aspect_ratio"] = p.get("aspect_ratio") or DEFAULTS["aspect_ratio"]
-    wf["19"]["inputs"]["megapixels"] = clamp(p.get("megapixels"), 0.25, 4, float, 1.0)
-    wf["18:16"]["inputs"]["switch"] = bool(p.get("upsampler", DEFAULTS["upsampler"]))
-    wf["18:24"]["inputs"]["switch"] = bool(p.get("slg", DEFAULTS["slg"]))
-    wf["18:11"]["inputs"]["sampling_mode.seed"] = seed
-    wf["18:1"]["inputs"]["unet_name"] = p.get("checkpoint") or DEFAULTS["checkpoint"]
-
-    curr_model = ["18:1", 0]
-    curr_clip = ["18:2", 0]
-
-    l1_name = p.get("lora1", "None")
-    l1_str = float(p.get("lora1_strength", 1.0))
-    # Turbo LoRA Protection: 8-step DMD LoRA requires CFG <= 1.5 and SLG off to avoid NaN latent explosion
-    if "8-step" in (str(l1_name) + str(p.get("lora2", "")) + str(p.get("lora3", ""))).lower():
-        if ks["cfg"] > 1.5:
-            ks["cfg"] = 1.0
-        wf["18:24"]["inputs"]["switch"] = False
-    if l1_name and l1_name != "None" and l1_str != 0:
-        wf["lora_1"] = {
-            "inputs": {"lora_name": l1_name, "strength_model": l1_str, "strength_clip": l1_str, "model": curr_model, "clip": curr_clip},
-            "class_type": "LoraLoader",
-            "_meta": {"title": f"LoRA 1 ({l1_name})"}
-        }
-        curr_model = ["lora_1", 0]
-        curr_clip = ["lora_1", 1]
-
-    l2_name = p.get("lora2", "None")
-    l2_str = float(p.get("lora2_strength", 1.0))
-    if l2_name and l2_name != "None" and l2_str != 0:
-        wf["lora_2"] = {
-            "inputs": {"lora_name": l2_name, "strength_model": l2_str, "strength_clip": l2_str, "model": curr_model, "clip": curr_clip},
-            "class_type": "LoraLoader",
-            "_meta": {"title": f"LoRA 2 ({l2_name})"}
-        }
-        curr_model = ["lora_2", 0]
-        curr_clip = ["lora_2", 1]
-
-    l3_name = p.get("lora3", "None")
-    l3_str = float(p.get("lora3_strength", 1.0))
-    if l3_name and l3_name != "None" and l3_str != 0:
-        wf["lora_3"] = {
-            "inputs": {"lora_name": l3_name, "strength_model": l3_str, "strength_clip": l3_str, "model": curr_model, "clip": curr_clip},
-            "class_type": "LoraLoader",
-            "_meta": {"title": f"LoRA 3 ({l3_name})"}
-        }
-        curr_model = ["lora_3", 0]
-        curr_clip = ["lora_3", 1]
 
     if curr_model != ["18:1", 0]:
         wf["18:15"]["inputs"]["model"] = curr_model
@@ -747,10 +748,15 @@ def describe_image():
 
 @app.post("/api/generate")
 def generate():
-    p = request.get_json(force=True, silent=True) or {}
-    if not (p.get("prompt") or "").strip():
-        return jsonify(error="Please enter a prompt."), 400
-    wf, seed = build_workflow(p)
+    try:
+        p = request.get_json(force=True, silent=True) or {}
+        if not (p.get("prompt") or "").strip():
+            return jsonify(error="Please enter a prompt."), 400
+        wf, seed = build_workflow(p)
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        return jsonify(error=f"Workflow build error: {str(e)}"), 500
     try:
         r = requests.post(
             f"{COMFY}/prompt",
@@ -1417,8 +1423,8 @@ function setSettings(s){
 }
 function getSettings(){
   const isI2I = window._activeTab === "img2img";
-  const pVal = isI2I ? ($("#prompt-i2i") ? $("#prompt-i2i").value : $("#prompt").value) : $("#prompt").value;
-  const nVal = isI2I ? ($("#negative-i2i") ? $("#negative-i2i").value : $("#negative").value) : $("#negative").value;
+  const pVal = (isI2I && $("#prompt-i2i") && $("#prompt-i2i").value.trim()) ? $("#prompt-i2i").value : $("#prompt").value;
+  const nVal = (isI2I && $("#negative-i2i") && $("#negative-i2i").value.trim()) ? $("#negative-i2i").value : $("#negative").value;
   const isRand = isI2I ? ($("#rand-i2i") ? $("#rand-i2i").checked : true) : $("#rand").checked;
   const sEl = isI2I ? $("#seed-i2i") : $("#seed");
   const sVal = isRand ? -1 : parseInt((sEl ? sEl.value : "") || "0", 10);
@@ -1613,7 +1619,13 @@ async function generate(){
     say(prefix + "Submitting…");
     try {
       const r = await fetch("/api/generate", {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(s)});
-      const d = await r.json();
+      let d = {};
+      try {
+        d = await r.json();
+      } catch (err) {
+        say((prefix || "") + `Backend error (${r.status}): Server returned non-JSON response.`, true);
+        break;
+      }
       if (!r.ok) { say((prefix || "") + (d.error || "Request failed."), true); break; }
       s.seed = d.seed; window._lastSettings = Object.assign({}, s);
       if (isRand) $("#seed").value = d.seed;
