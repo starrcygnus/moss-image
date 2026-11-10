@@ -103,13 +103,13 @@ wf_path = os.path.join(HERE, "workflow_anima_api.json")
 if not os.path.exists(wf_path):
     # Fallback to local default if file not yet present
     WORKFLOW = {
-        "1": {"inputs": {"unet_name": "anima-base-v1.0.safetensors"}, "class_type": "UNETLoader"},
+        "1": {"inputs": {"unet_name": "anima-base-v1.0.safetensors", "weight_dtype": "default"}, "class_type": "UNETLoader"},
         "2": {"inputs": {"clip_name": "qwen_3_06b_base.safetensors", "type": "qwen_image"}, "class_type": "CLIPLoader"},
         "3": {"inputs": {"vae_name": "qwen_image_vae.safetensors"}, "class_type": "VAELoader"},
         "4": {"inputs": {"text": "", "clip": ["2", 0]}, "class_type": "CLIPTextEncode"},
         "5": {"inputs": {"text": "worst quality, low quality, bad anatomy, bad hands, missing fingers, extra digits, signature, watermark", "clip": ["2", 0]}, "class_type": "CLIPTextEncode"},
         "6": {"inputs": {"width": 1024, "height": 1024, "batch_size": 1}, "class_type": "EmptyLatentImage"},
-        "7": {"inputs": {"seed": 0, "steps": 35, "cfg": 4.5, "sampler_name": "euler", "scheduler": "normal", "denoise": 1.0, "model": ["1", 0], "positive": ["4", 0], "negative": ["5", 0], "latent_image": ["6", 0]}, "class_type": "KSampler"},
+        "7": {"inputs": {"seed": 0, "steps": 35, "cfg": 4.5, "sampler_name": "er_sde", "scheduler": "normal", "denoise": 1.0, "model": ["1", 0], "positive": ["4", 0], "negative": ["5", 0], "latent_image": ["6", 0]}, "class_type": "KSampler"},
         "8": {"inputs": {"samples": ["7", 0], "vae": ["3", 0]}, "class_type": "VAEDecode"},
         "9": {"inputs": {"filename_prefix": "Anima", "images": ["8", 0]}, "class_type": "SaveImage"}
     }
@@ -122,12 +122,13 @@ DEFAULTS = {
     "negative": "worst quality, low quality, bad anatomy, bad hands, missing fingers, extra digits, signature, watermark",
     "steps": 35,
     "cfg": 4.5,
-    "sampler": "euler",
+    "sampler": "er_sde",
     "scheduler": "normal",
     "aspect_ratio": "1:1",
     "width": 1024,
     "height": 1024,
     "checkpoint": "anima-base-v1.0.safetensors",
+    "weight_dtype": "default",
 }
 
 def clamp(val, low, high, typ=int, default=0):
@@ -184,8 +185,9 @@ def build_workflow(p):
     wf["6"]["inputs"]["width"] = w
     wf["6"]["inputs"]["height"] = h
 
-    # Checkpoint
+    # Checkpoint & Precision
     wf["1"]["inputs"]["unet_name"] = p.get("checkpoint") or DEFAULTS["checkpoint"]
+    wf["1"]["inputs"]["weight_dtype"] = p.get("weight_dtype") or DEFAULTS.get("weight_dtype", "default")
 
     # Chain up to 6 LoRAs dynamically
     curr_model = ["1", 0]
@@ -393,6 +395,63 @@ def run_wd_tagger(image_path, general_threshold=0.35, character_threshold=0.75):
         "general": general,
         "ratings": ratings
     }
+
+# ---------------------------------------------------------------------------
+# Booru Tag Autocomplete Engine
+# ---------------------------------------------------------------------------
+_booru_tags = None
+
+def load_booru_tags():
+    global _booru_tags
+    if _booru_tags is not None:
+        return _booru_tags
+
+    tags = []
+    tags_file = os.path.join(WD_DIR, "selected_tags.csv")
+    if os.path.exists(tags_file):
+        try:
+            with open(tags_file, "r", encoding="utf-8") as f:
+                reader = csv.reader(f)
+                header = next(reader, None)
+                for row in reader:
+                    if len(row) >= 4:
+                        t_name = row[1].replace("_", " ")
+                        t_cat = int(row[2])
+                        t_count = int(row[3]) if row[3].isdigit() else 0
+                        tags.append((t_name, t_cat, t_count))
+        except Exception as e:
+            print(f"Error reading tags CSV: {e}")
+
+    if not tags:
+        # High-frequency Danbooru starter tags for immediate autocomplete fallback
+        starter = [
+            ("1girl", 0, 5200000), ("solo", 0, 4800000), ("long hair", 0, 2400000),
+            ("looking at viewer", 0, 2300000), ("smile", 0, 2100000), ("short hair", 0, 1900000),
+            ("breasts", 0, 1800000), ("blush", 0, 1700000), ("blue eyes", 0, 1500000),
+            ("open mouth", 0, 1400000), ("simple background", 0, 1300000), ("white background", 0, 1200000),
+            ("black hair", 0, 1100000), ("large breasts", 0, 1050000), ("brown hair", 0, 1000000),
+            ("twintails", 0, 850000), ("ponytail", 0, 800000), ("skirt", 0, 950000),
+            ("school uniform", 0, 900000), ("thighhighs", 0, 850000), ("dress", 0, 820000),
+            ("gloves", 0, 800000), ("hair ornament", 0, 780000), ("collarbone", 0, 750000),
+            ("cleavage", 0, 720000), ("navel", 0, 700000), ("bare shoulders", 0, 680000),
+            ("ribbon", 0, 650000), ("bow", 0, 640000), ("jacket", 0, 620000),
+            ("shirt", 0, 600000), ("underwear", 0, 580000), ("panties", 0, 550000),
+            ("bra", 0, 520000), ("lingerie", 0, 490000), ("garter belt", 0, 420000),
+            ("sitting", 0, 610000), ("standing", 0, 590000), ("lying", 0, 390000),
+            ("masterpiece", 0, 2900000), ("best quality", 0, 2800000), ("score 9", 0, 1500000),
+            ("sensitive", 0, 1200000), ("newest", 0, 900000),
+            ("hatsune miku", 4, 150000), ("ouro kronii", 4, 45000), ("gawr gura", 4, 60000),
+            ("frieren", 4, 55000), ("rem (re:zero)", 4, 85000), ("asuka langley soryu", 4, 90000),
+            ("kamado nezuko", 4, 70000), ("makima (chainsaw man)", 4, 48000), ("2b (nier:automata)", 4, 65000),
+            ("tifa lockhart", 4, 58000),
+            ("taiyang yu", 1, 10000), ("bboky0", 1, 8000), ("tony taka", 1, 15000),
+            ("kantoku", 1, 18000), ("citemori", 1, 5000), ("sho (sho_lwlw)", 1, 7000),
+            ("hiten", 1, 12000), ("anmi", 1, 14000), ("tiv", 1, 11000), ("wlop", 1, 20000)
+        ]
+        tags = starter
+
+    _booru_tags = tags
+    return _booru_tags
 
 # ---------------------------------------------------------------------------
 # Robust Background Model & LoRA Downloader (Civitai, HuggingFace, GDrive)
@@ -705,8 +764,25 @@ def get_models():
             if f.lower().endswith((".safetensors", ".pt")):
                 loras.append(f)
 
-    samplers = ["euler", "euler_ancestral", "dpmpp_2m", "dpmpp_sde", "ddim", "uni_pc", "heun"]
+    samplers = ["er_sde", "euler", "euler_ancestral", "dpmpp_2m", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_3m_sde", "dpmpp_sde_gpu", "ddim", "uni_pc", "heun", "lms"]
     schedulers = ["normal", "simple", "karras", "sgm_uniform", "exponential"]
+    try:
+        k_info = comfy_get("/object_info/KSampler")
+        req_inputs = k_info.get("KSampler", {}).get("input", {}).get("required", {})
+        avail_samplers = req_inputs.get("sampler_name", [[]])[0]
+        if avail_samplers:
+            s_list = []
+            if "er_sde" in avail_samplers:
+                s_list.append("er_sde")
+            for s in avail_samplers:
+                if s not in s_list:
+                    s_list.append(s)
+            samplers = s_list
+        avail_sched = req_inputs.get("scheduler", [[]])[0]
+        if avail_sched:
+            schedulers = avail_sched
+    except Exception:
+        pass
 
     return jsonify(
         models=models,
@@ -715,6 +791,36 @@ def get_models():
         schedulers=schedulers,
         resolutions=RESOLUTIONS
     )
+
+@app.get("/api/tags")
+def search_tags():
+    q = (request.args.get("q") or "").strip().lower().replace("_", " ")
+    tags = load_booru_tags()
+    if not q:
+        return jsonify(tags=[{"name": t[0], "cat": t[1], "count": t[2]} for t in tags[:20]])
+
+    is_artist_q = q.startswith("@")
+    clean_q = q[1:] if is_artist_q else q
+
+    matches = []
+    # 1) Prefix match
+    for name, cat, count in tags:
+        comp_name = f"@{name}" if cat == 1 else name
+        if comp_name.lower().startswith(q) or name.lower().startswith(clean_q):
+            matches.append({"name": comp_name, "cat": cat, "count": count})
+            if len(matches) >= 15:
+                break
+
+    # 2) Substring match if less than 15
+    if len(matches) < 15:
+        for name, cat, count in tags:
+            comp_name = f"@{name}" if cat == 1 else name
+            if clean_q in name.lower() and not any(m["name"] == comp_name for m in matches):
+                matches.append({"name": comp_name, "cat": cat, "count": count})
+                if len(matches) >= 15:
+                    break
+
+    return jsonify(tags=matches)
 
 @app.post("/api/generate")
 def generate():
@@ -1254,6 +1360,44 @@ INDEX_HTML = r'''<!doctype html>
       animation: spin 0.7s linear infinite;
     }
     @keyframes spin { to { transform: rotate(360deg); } }
+    .tag-autocomplete-menu {
+      position: absolute;
+      top: 100%;
+      left: 0;
+      right: 0;
+      z-index: 9999;
+      background: #11141a;
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      box-shadow: 0 10px 30px rgba(0,0,0,0.8);
+      max-height: 220px;
+      overflow-y: auto;
+      display: none;
+    }
+    .tag-ac-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      padding: 6px 10px;
+      font-size: 11.5px;
+      cursor: pointer;
+      border-bottom: 1px solid rgba(255,255,255,0.03);
+    }
+    .tag-ac-item:hover, .tag-ac-item.active {
+      background: var(--accent-glow);
+      color: #fff;
+    }
+    .tag-ac-badge {
+      font-size: 9.5px;
+      padding: 1px 5px;
+      border-radius: 3px;
+      font-weight: 600;
+    }
+    .tag-ac-badge.general { background: rgba(255,255,255,0.08); color: var(--text-muted); }
+    .tag-ac-badge.character { background: rgba(236,72,153,0.25); color: #f472b6; border: 1px solid rgba(236,72,153,0.4); }
+    .tag-ac-badge.artist { background: rgba(168,85,247,0.25); color: #c084fc; border: 1px solid rgba(168,85,247,0.4); }
+    .tag-ac-badge.copyright { background: rgba(6,182,212,0.25); color: #22d3ee; border: 1px solid rgba(6,182,212,0.4); }
+    .tag-ac-count { font-size: 10px; color: var(--text-muted); margin-left: 6px; }
   </style>
 </head>
 <body>
@@ -1282,13 +1426,14 @@ INDEX_HTML = r'''<!doctype html>
       </div>
 
       <div class="controls-scroll">
-        <!-- Common Prompt Section -->
-        <div class="prompt-box">
+        <!-- Common Prompt Section with Booru Autocomplete -->
+        <div class="prompt-box" style="position:relative;">
           <div class="box-header">
-            <span>Positive Prompt (Danbooru + Natural Language)</span>
+            <span>Positive Prompt (Danbooru Autocomplete Active)</span>
             <button class="btn-sub" style="padding:1px 5px;" onclick="$('#prompt').value=''">✕</button>
           </div>
-          <textarea id="prompt" rows="3" placeholder="1girl, solo, hatsune miku, twintails, blue eyes, futuristic city, @artist..."></textarea>
+          <textarea id="prompt" rows="3" placeholder="Type anime tags (e.g. 1girl, @artist, hatsune miku)..." autocomplete="off" spellcheck="false"></textarea>
+          <div id="tag-autocomplete" class="tag-autocomplete-menu"></div>
         </div>
 
         <div class="accordion">
@@ -1336,11 +1481,23 @@ INDEX_HTML = r'''<!doctype html>
           <div class="row" style="margin-bottom:8px;">
             <div class="col">
               <label>Sampler</label>
-              <select id="sampler"></select>
+              <select id="sampler">
+                <option value="er_sde" selected>er_sde</option>
+                <option value="euler">euler</option>
+                <option value="euler_ancestral">euler_ancestral</option>
+                <option value="dpmpp_2m">dpmpp_2m</option>
+                <option value="dpmpp_sde">dpmpp_sde</option>
+                <option value="dpmpp_2m_sde">dpmpp_2m_sde</option>
+              </select>
             </div>
             <div class="col">
               <label>Scheduler</label>
-              <select id="scheduler"></select>
+              <select id="scheduler">
+                <option value="normal" selected>normal</option>
+                <option value="simple">simple</option>
+                <option value="karras">karras</option>
+                <option value="sgm_uniform">sgm_uniform</option>
+              </select>
             </div>
           </div>
 
@@ -1453,10 +1610,123 @@ INDEX_HTML = r'''<!doctype html>
         <div class="accordion" style="margin-top:4px;">
           <div class="accordion-header" onclick="toggleAcc(this)">
             <span>🎛️ LoRA Rack (6 Slots Active)</span>
-            <span id="lora-active-badge" style="font-size:10px; color:var(--accent);">0 loaded</span>
+            <span id="lora-active-badge" style="font-size:10px; color:var(--accent);">0 active</span>
           </div>
-          <div class="accordion-body" id="lora-rack-body" style="display:none;">
-            <!-- LoRA Slots 1-6 generated in JS -->
+          <div class="accordion-body" id="lora-rack-body" style="display:flex; flex-direction:column; gap:8px; max-height:280px; overflow-y:auto; padding:8px;">
+            <div class="lora-slot" id="slot-card-1">
+              <div class="lora-header">
+                <label><input type="checkbox" id="lora-1-on" checked onchange="updateLoraBadge()"> Slot 1</label>
+                <div class="row" style="gap:4px; align-items:center;">
+                  <span style="font-size:10px; color:var(--text-muted);">Weight:</span>
+                  <input type="number" id="lora-1-num" step="0.05" min="-5.0" max="10.0" value="1.0"
+                    style="width:68px; padding:2px 4px; font-size:11px; font-weight:600; text-align:center; background:var(--bg-card); border:1px solid var(--border); border-radius:4px; color:var(--text);"
+                    oninput="syncLoraWeight(1, 'num')">
+                  <button type="button" class="btn-sub" style="padding:1px 5px; font-size:10px;" onclick="resetLoraSlot(1)" title="Reset to 1.0">↺</button>
+                </div>
+              </div>
+              <div class="row" style="margin-top:2px;">
+                <select id="lora-1-name" style="flex:1;" onchange="updateLoraBadge()">
+                  <option value="None">None</option>
+                </select>
+                <input type="range" id="lora-1-str" min="-2.0" max="5.0" step="0.05" value="1.0" style="width:130px;"
+                  oninput="syncLoraWeight(1, 'range')">
+              </div>
+            </div>
+            <div class="lora-slot" id="slot-card-2">
+              <div class="lora-header">
+                <label><input type="checkbox" id="lora-2-on" checked onchange="updateLoraBadge()"> Slot 2</label>
+                <div class="row" style="gap:4px; align-items:center;">
+                  <span style="font-size:10px; color:var(--text-muted);">Weight:</span>
+                  <input type="number" id="lora-2-num" step="0.05" min="-5.0" max="10.0" value="1.0"
+                    style="width:68px; padding:2px 4px; font-size:11px; font-weight:600; text-align:center; background:var(--bg-card); border:1px solid var(--border); border-radius:4px; color:var(--text);"
+                    oninput="syncLoraWeight(2, 'num')">
+                  <button type="button" class="btn-sub" style="padding:1px 5px; font-size:10px;" onclick="resetLoraSlot(2)" title="Reset to 1.0">↺</button>
+                </div>
+              </div>
+              <div class="row" style="margin-top:2px;">
+                <select id="lora-2-name" style="flex:1;" onchange="updateLoraBadge()">
+                  <option value="None">None</option>
+                </select>
+                <input type="range" id="lora-2-str" min="-2.0" max="5.0" step="0.05" value="1.0" style="width:130px;"
+                  oninput="syncLoraWeight(2, 'range')">
+              </div>
+            </div>
+            <div class="lora-slot" id="slot-card-3">
+              <div class="lora-header">
+                <label><input type="checkbox" id="lora-3-on" checked onchange="updateLoraBadge()"> Slot 3</label>
+                <div class="row" style="gap:4px; align-items:center;">
+                  <span style="font-size:10px; color:var(--text-muted);">Weight:</span>
+                  <input type="number" id="lora-3-num" step="0.05" min="-5.0" max="10.0" value="1.0"
+                    style="width:68px; padding:2px 4px; font-size:11px; font-weight:600; text-align:center; background:var(--bg-card); border:1px solid var(--border); border-radius:4px; color:var(--text);"
+                    oninput="syncLoraWeight(3, 'num')">
+                  <button type="button" class="btn-sub" style="padding:1px 5px; font-size:10px;" onclick="resetLoraSlot(3)" title="Reset to 1.0">↺</button>
+                </div>
+              </div>
+              <div class="row" style="margin-top:2px;">
+                <select id="lora-3-name" style="flex:1;" onchange="updateLoraBadge()">
+                  <option value="None">None</option>
+                </select>
+                <input type="range" id="lora-3-str" min="-2.0" max="5.0" step="0.05" value="1.0" style="width:130px;"
+                  oninput="syncLoraWeight(3, 'range')">
+              </div>
+            </div>
+            <div class="lora-slot" id="slot-card-4">
+              <div class="lora-header">
+                <label><input type="checkbox" id="lora-4-on" checked onchange="updateLoraBadge()"> Slot 4</label>
+                <div class="row" style="gap:4px; align-items:center;">
+                  <span style="font-size:10px; color:var(--text-muted);">Weight:</span>
+                  <input type="number" id="lora-4-num" step="0.05" min="-5.0" max="10.0" value="1.0"
+                    style="width:68px; padding:2px 4px; font-size:11px; font-weight:600; text-align:center; background:var(--bg-card); border:1px solid var(--border); border-radius:4px; color:var(--text);"
+                    oninput="syncLoraWeight(4, 'num')">
+                  <button type="button" class="btn-sub" style="padding:1px 5px; font-size:10px;" onclick="resetLoraSlot(4)" title="Reset to 1.0">↺</button>
+                </div>
+              </div>
+              <div class="row" style="margin-top:2px;">
+                <select id="lora-4-name" style="flex:1;" onchange="updateLoraBadge()">
+                  <option value="None">None</option>
+                </select>
+                <input type="range" id="lora-4-str" min="-2.0" max="5.0" step="0.05" value="1.0" style="width:130px;"
+                  oninput="syncLoraWeight(4, 'range')">
+              </div>
+            </div>
+            <div class="lora-slot" id="slot-card-5">
+              <div class="lora-header">
+                <label><input type="checkbox" id="lora-5-on" checked onchange="updateLoraBadge()"> Slot 5</label>
+                <div class="row" style="gap:4px; align-items:center;">
+                  <span style="font-size:10px; color:var(--text-muted);">Weight:</span>
+                  <input type="number" id="lora-5-num" step="0.05" min="-5.0" max="10.0" value="1.0"
+                    style="width:68px; padding:2px 4px; font-size:11px; font-weight:600; text-align:center; background:var(--bg-card); border:1px solid var(--border); border-radius:4px; color:var(--text);"
+                    oninput="syncLoraWeight(5, 'num')">
+                  <button type="button" class="btn-sub" style="padding:1px 5px; font-size:10px;" onclick="resetLoraSlot(5)" title="Reset to 1.0">↺</button>
+                </div>
+              </div>
+              <div class="row" style="margin-top:2px;">
+                <select id="lora-5-name" style="flex:1;" onchange="updateLoraBadge()">
+                  <option value="None">None</option>
+                </select>
+                <input type="range" id="lora-5-str" min="-2.0" max="5.0" step="0.05" value="1.0" style="width:130px;"
+                  oninput="syncLoraWeight(5, 'range')">
+              </div>
+            </div>
+            <div class="lora-slot" id="slot-card-6">
+              <div class="lora-header">
+                <label><input type="checkbox" id="lora-6-on" checked onchange="updateLoraBadge()"> Slot 6</label>
+                <div class="row" style="gap:4px; align-items:center;">
+                  <span style="font-size:10px; color:var(--text-muted);">Weight:</span>
+                  <input type="number" id="lora-6-num" step="0.05" min="-5.0" max="10.0" value="1.0"
+                    style="width:68px; padding:2px 4px; font-size:11px; font-weight:600; text-align:center; background:var(--bg-card); border:1px solid var(--border); border-radius:4px; color:var(--text);"
+                    oninput="syncLoraWeight(6, 'num')">
+                  <button type="button" class="btn-sub" style="padding:1px 5px; font-size:10px;" onclick="resetLoraSlot(6)" title="Reset to 1.0">↺</button>
+                </div>
+              </div>
+              <div class="row" style="margin-top:2px;">
+                <select id="lora-6-name" style="flex:1;" onchange="updateLoraBadge()">
+                  <option value="None">None</option>
+                </select>
+                <input type="range" id="lora-6-str" min="-2.0" max="5.0" step="0.05" value="1.0" style="width:130px;"
+                  oninput="syncLoraWeight(6, 'range')">
+              </div>
+            </div>
           </div>
         </div>
 
@@ -1564,46 +1834,47 @@ INDEX_HTML = r'''<!doctype html>
 
         // Checkpoint dropdown
         const cp = $('#checkpoint');
+        const curCp = cp.value;
         cp.innerHTML = gState.models.map(m => `<option value="${m}">${m}</option>`).join('');
+        if (gState.models.includes(curCp)) cp.value = curCp;
 
-        // Sampler & Scheduler
-        $('#sampler').innerHTML = data.samplers.map(s => `<option value="${s}">${s}</option>`).join('');
+        // Sampler & Scheduler (er_sde preferred for Anima)
+        const sm = $('#sampler');
+        let samplers = data.samplers || [];
+        if (samplers.includes('er_sde')) {
+          samplers = ['er_sde', ...samplers.filter(s => s !== 'er_sde')];
+        }
+        const curSm = sm.value;
+        sm.innerHTML = samplers.map(s => `<option value="${s}">${s}</option>`).join('');
+        if (curSm && curSm !== 'euler' && samplers.includes(curSm)) {
+          sm.value = curSm;
+        } else if (samplers.includes('er_sde')) {
+          sm.value = 'er_sde';
+        }
+
         $('#scheduler').innerHTML = data.schedulers.map(s => `<option value="${s}">${s}</option>`).join('');
 
-        // Build 6 LoRA slots
-        buildLoraSlots();
+        // Populate all 6 LoRA select dropdowns
+        populateLoraSlots();
       } catch (e) {
         console.error("Failed loading models", e);
       }
     }
 
-    function buildLoraSlots() {
-      const container = $('#lora-rack-body');
-      let html = '';
+    function populateLoraSlots() {
       for (let i = 1; i <= 6; i++) {
-        html += `
-          <div class="lora-slot">
-            <div class="lora-header">
-              <label><input type="checkbox" id="lora-${i}-on" checked onchange="updateLoraBadge()"> Slot ${i}</label>
-              <div class="row" style="gap:4px; align-items:center;">
-                <span style="font-size:10px; color:var(--text-muted);">Weight:</span>
-                <input type="number" id="lora-${i}-num" step="0.05" min="-5.0" max="10.0" value="1.0"
-                  style="width:68px; padding:2px 4px; font-size:11px; font-weight:600; text-align:center; background:var(--bg-card); border:1px solid var(--border); border-radius:4px; color:var(--text);"
-                  oninput="syncLoraWeight(${i}, 'num')">
-                <button type="button" class="btn-sub" style="padding:1px 5px; font-size:10px;" onclick="resetLoraSlot(${i})" title="Reset to 1.0">↺</button>
-              </div>
-            </div>
-            <div class="row" style="margin-top:2px;">
-              <select id="lora-${i}-name" style="flex:1;" onchange="updateLoraBadge()">
-                ${gState.loras.map(l => `<option value="${l}">${l}</option>`).join('')}
-              </select>
-              <input type="range" id="lora-${i}-str" min="-2.0" max="5.0" step="0.05" value="1.0" style="width:130px;"
-                oninput="syncLoraWeight(${i}, 'range')">
-            </div>
-          </div>
-        `;
+        const sel = $(`#lora-${i}-name`);
+        if (sel) {
+          const curL = sel.value;
+          sel.innerHTML = gState.loras.map(l => `<option value="${l}">${l}</option>`).join('');
+          if (curL && gState.loras.includes(curL)) {
+            sel.value = curL;
+          } else if (i === 1) {
+            const turbo = gState.loras.find(l => l.toLowerCase().includes('turbo'));
+            if (turbo) sel.value = turbo;
+          }
+        }
       }
-      container.innerHTML = html;
       updateLoraBadge();
     }
 
@@ -1988,6 +2259,124 @@ INDEX_HTML = r'''<!doctype html>
     document.addEventListener('keydown', e => {
       if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
         startGenerate();
+      }
+    });
+
+
+    // ---------------------------------------------------------------------------
+    // Booru Tag Autocomplete Controller
+    // ---------------------------------------------------------------------------
+    const promptEl = $('#prompt');
+    const acMenu = $('#tag-autocomplete');
+    let acItems = [];
+    let acActiveIdx = -1;
+    let acDebounce = null;
+
+    function getActiveTokenInfo() {
+      const val = promptEl.value;
+      const pos = promptEl.selectionStart;
+      const beforeCursor = val.slice(0, pos);
+      const lastDelim = Math.max(beforeCursor.lastIndexOf(','), beforeCursor.lastIndexOf('\n'));
+      const tokenStart = lastDelim === -1 ? 0 : lastDelim + 1;
+      const token = beforeCursor.slice(tokenStart).trim();
+      return { token, tokenStart, pos };
+    }
+
+    if (promptEl) {
+      promptEl.addEventListener('input', () => {
+        clearTimeout(acDebounce);
+        acDebounce = setTimeout(async () => {
+          const { token } = getActiveTokenInfo();
+          if (!token || token.length < 2) {
+            hideAutocomplete();
+            return;
+          }
+          try {
+            const res = await fetch('/api/tags?q=' + encodeURIComponent(token));
+            const data = await res.json();
+            renderAutocomplete(data.tags || []);
+          } catch (e) {
+            hideAutocomplete();
+          }
+        }, 120);
+      });
+
+      promptEl.addEventListener('keydown', e => {
+        if (acMenu.style.display !== 'block') return;
+        if (e.key === 'ArrowDown') {
+          e.preventDefault();
+          acActiveIdx = (acActiveIdx + 1) % acItems.length;
+          updateActiveAcItem();
+        } else if (e.key === 'ArrowUp') {
+          e.preventDefault();
+          acActiveIdx = (acActiveIdx - 1 + acItems.length) % acItems.length;
+          updateActiveAcItem();
+        } else if (e.key === 'Enter' || e.key === 'Tab') {
+          if (acActiveIdx >= 0 && acActiveIdx < acItems.length) {
+            e.preventDefault();
+            selectAcTag(acItems[acActiveIdx].name);
+          }
+        } else if (e.key === 'Escape') {
+          hideAutocomplete();
+        }
+      });
+    }
+
+    function renderAutocomplete(tags) {
+      if (!tags.length) {
+        hideAutocomplete();
+        return;
+      }
+      acItems = tags;
+      acActiveIdx = 0;
+      let html = '';
+      tags.forEach((t, idx) => {
+        const catClass = t.cat === 4 ? 'character' : (t.cat === 1 ? 'artist' : (t.cat === 3 ? 'copyright' : 'general'));
+        const catLabel = t.cat === 4 ? 'char' : (t.cat === 1 ? 'artist' : (t.cat === 3 ? 'series' : 'tag'));
+        const countFmt = t.count > 1000000 ? `${(t.count/1000000).toFixed(1)}M` : (t.count > 1000 ? `${(t.count/1000).toFixed(0)}k` : t.count);
+        html += `
+          <div class="tag-ac-item ${idx === 0 ? 'active' : ''}" onclick="selectAcTag('${t.name}')">
+            <span><b>${t.name}</b> <span class="tag-ac-count">${countFmt}</span></span>
+            <span class="tag-ac-badge ${catClass}">${catLabel}</span>
+          </div>
+        `;
+      });
+      acMenu.innerHTML = html;
+      acMenu.style.display = 'block';
+    }
+
+    function updateActiveAcItem() {
+      const items = acMenu.querySelectorAll('.tag-ac-item');
+      items.forEach((item, idx) => {
+        item.classList.toggle('active', idx === acActiveIdx);
+        if (idx === acActiveIdx) item.scrollIntoView({ block: 'nearest' });
+      });
+    }
+
+    function selectAcTag(tag) {
+      const { tokenStart, pos } = getActiveTokenInfo();
+      const val = promptEl.value;
+      const before = val.slice(0, tokenStart);
+      const after = val.slice(pos);
+      const prefix = (before && !before.endsWith(' ') && !before.endsWith('\n')) ? ' ' : '';
+      promptEl.value = before + prefix + tag + ', ' + after.replace(/^[\s,]+/, '');
+      hideAutocomplete();
+      promptEl.focus();
+      const newCursor = (before + prefix + tag + ', ').length;
+      promptEl.setSelectionRange(newCursor, newCursor);
+    }
+
+    function hideAutocomplete() {
+      if (acMenu) {
+        acMenu.style.display = 'none';
+        acItems = [];
+        acActiveIdx = -1;
+      }
+    }
+
+    document.addEventListener('click', e => {
+      if (acMenu && !acMenu.contains(e.target) && e.target !== promptEl) {
+        hideAutocomplete();
       }
     });
 
