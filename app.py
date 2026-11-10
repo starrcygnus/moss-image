@@ -1,3 +1,4 @@
+import re
 import copy
 import json
 import os
@@ -1020,6 +1021,10 @@ textarea{resize:vertical}input[type=range]{width:100%;accent-color:var(--acc)}
 .chk{display:flex;gap:9px;align-items:flex-start;font-size:14px;margin:12px 0 0}.chk input{margin-top:3px;accent-color:var(--acc)}
 .chk small{display:block;color:var(--mut);font-size:12px}
 .lora-box{background:#11131a;border:1px solid var(--line);border-radius:10px;padding:10px;margin-top:12px}
+.tab-bar{display:flex;gap:6px;margin:0 0 10px 0;border-bottom:1px solid var(--line);padding-bottom:8px}
+.tab-btn{flex:1;background:transparent;color:var(--mut);border:1px solid transparent;border-radius:8px;padding:8px 10px;font-size:12px;font-weight:600;cursor:pointer;transition:all .15s ease}
+.tab-btn:hover{color:var(--txt);background:rgba(255,255,255,0.04)}
+.tab-btn.active{color:#fff;background:linear-gradient(135deg,rgba(124,140,255,0.25),rgba(167,139,250,0.25));border-color:var(--acc)}
 .btns{display:flex;gap:8px;align-items:center;flex-wrap:wrap}.btns-top{position:sticky;top:0;z-index:20;background:var(--panel);padding:4px 0 14px 0;margin:0 0 12px 0;border-bottom:1px solid var(--line)}#go{flex:1;min-width:120px;padding:11px 16px;font-size:14px;box-shadow:0 4px 14px rgba(124,140,255,0.3);letter-spacing:.3px}#stop{padding:11px 14px;white-space:nowrap}.batch-box{display:flex;align-items:center;gap:6px;background:var(--bg);border:1px solid var(--line);border-radius:10px;padding:0 12px}.batch-box label{font-size:11px;color:var(--mut);text-transform:uppercase;font-weight:600;margin:0;letter-spacing:.5px}.batch-box input{width:46px;border:0;background:transparent;padding:10px 2px;text-align:center;font-weight:700;color:var(--txt);font-size:15px}.batch-box input:focus{outline:none}.dropzone{border:2px dashed var(--line);border-radius:12px;padding:12px;text-align:center;cursor:pointer;background:var(--bg);transition:border-color .2s,background .2s;margin-top:10px}.dropzone:hover,.dropzone.dragover{border-color:var(--acc);background:rgba(124,140,255,0.06)}.dropzone-empty{display:flex;align-items:center;justify-content:center;gap:10px;color:var(--mut);font-size:13px}.dropzone-empty b{color:var(--txt)}.dropzone-preview{display:flex;align-items:center;gap:12px}.dropzone-preview img{width:56px;height:56px;object-fit:cover;border-radius:8px;border:1px solid var(--line)}.dropzone-info{flex:1;text-align:left;overflow:hidden}.dropzone-info .fn{font-weight:600;font-size:13px;color:var(--txt);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}.meta-badge{display:inline-block;font-size:11px;background:rgba(124,140,255,0.18);color:var(--acc);padding:2px 8px;border-radius:6px;margin-top:3px;font-weight:600}.drop-actions{display:flex;gap:6px;align-items:center}.btn-describe{background:linear-gradient(135deg,rgba(124,140,255,0.22),rgba(160,120,255,0.22));border:1px solid var(--acc);color:var(--txt);font-size:12px;font-weight:600;padding:5px 10px;border-radius:6px;cursor:pointer;white-space:nowrap;transition:all .15s ease}.btn-describe:hover{background:var(--acc);color:#fff;box-shadow:0 2px 8px rgba(124,140,255,0.4)}.btn-describe:disabled{opacity:0.5;cursor:not-allowed}.ghost-sm{background:transparent;border:1px solid var(--line);color:var(--mut);font-size:12px;padding:4px 10px;border-radius:6px;cursor:pointer}.ghost-sm:hover{color:var(--err);border-color:var(--err)}
 button{border:0;border-radius:10px;padding:11px 16px;font:inherit;font-weight:600;cursor:pointer;color:#fff;background:linear-gradient(135deg,var(--acc),var(--acc2))}
 button:disabled{opacity:.5;cursor:not-allowed}button.ghost{background:transparent;border:1px solid var(--line);color:var(--txt)}
@@ -1041,90 +1046,116 @@ h3{font-size:13px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px;
 <main>
   <section class="panel">
     <div class="btns btns-top"><button id="go">✨ Generate</button><div class="batch-box"><label for="batch">Images</label><input type="number" id="batch" min="1" max="10" value="1" title="How many images to generate (e.g. 2 for 2 variations)"></div><button id="stop" class="ghost" hidden>Cancel</button></div>
-    <label for="prompt">Prompt</label><textarea id="prompt" rows="4" placeholder="Describe the image you want to generate..."></textarea>
-    <label for="negative">Negative prompt</label><textarea id="negative" rows="1" placeholder="worst quality, bad anatomy..."></textarea>
-    <div class="dropzone" id="dropzone">
-      <input type="file" id="file-input" accept="image/png,image/jpeg,image/webp" hidden>
-      <div id="drop-empty" class="dropzone-empty">
-        <span style="font-size:18px">🖼️</span>
-        <div><b>img2img</b> (drop/browse)<br><small style="font-size:10px;color:var(--mut)">Leave empty for text-to-image</small></div>
+    
+    <div class="tab-bar">
+      <button type="button" class="tab-btn active" id="tab-btn-gen">🎨 Generation</button>
+      <button type="button" class="tab-btn" id="tab-btn-dl">📥 Downloader</button>
+    </div>
+
+    <!-- TAB 1: GENERATION -->
+    <div id="tab-gen">
+      <label for="prompt">Prompt</label><textarea id="prompt" rows="4" placeholder="Describe the image you want to generate..."></textarea>
+      <label for="negative">Negative prompt</label><textarea id="negative" rows="1" placeholder="worst quality, bad anatomy..."></textarea>
+      <div class="dropzone" id="dropzone">
+        <input type="file" id="file-input" accept="image/png,image/jpeg,image/webp" hidden>
+        <div id="drop-empty" class="dropzone-empty">
+          <span style="font-size:18px">🖼️</span>
+          <div><b>img2img</b> (drop/browse)<br><small style="font-size:10px;color:var(--mut)">Leave empty for text-to-image</small></div>
+        </div>
+        <div id="drop-filled" class="dropzone-preview" hidden>
+          <img id="drop-thumb" alt="Preview">
+          <div class="dropzone-info">
+            <div class="fn" id="drop-fname">photo.png</div>
+            <div id="drop-meta-badge" class="meta-badge" hidden>✨ Embedded prompt loaded</div>
+          </div>
+          <div class="drop-actions">
+            <button type="button" id="drop-describe" class="btn-describe" title="Analyze image and generate prompt with Florence-2">🔍 AI Describe</button>
+            <button type="button" id="drop-clear" class="ghost-sm" title="Remove reference image">✕ Remove</button>
+          </div>
+        </div>
       </div>
-      <div id="drop-filled" class="dropzone-preview" hidden>
-        <img id="drop-thumb" alt="Preview">
-        <div class="dropzone-info">
-          <div class="fn" id="drop-fname">photo.png</div>
-          <div id="drop-meta-badge" class="meta-badge" hidden>✨ Embedded prompt loaded</div>
-        </div>
-        <div class="drop-actions">
-          <button type="button" id="drop-describe" class="btn-describe" title="Analyze image and generate prompt with Florence-2">🔍 AI Describe</button>
-          <button type="button" id="drop-clear" class="ghost-sm" title="Remove reference image">✕ Remove</button>
-        </div>
+      <div id="denoise-row" style="margin-top:8px;display:none">
+        <label for="denoise">Denoise: <b id="denoise-val">0.65</b><small style="display:inline;margin-left:6px;font-size:10px;color:var(--mut)">(0.35=keep, 0.70=creative)</small></label>
+        <input type="range" id="denoise" min="0.10" max="1.0" step="0.05" value="0.65">
       </div>
-    </div>
-    <div id="denoise-row" style="margin-top:8px;display:none">
-      <label for="denoise">Denoise: <b id="denoise-val">0.65</b><small style="display:inline;margin-left:6px;font-size:10px;color:var(--mut)">(0.35=keep, 0.70=creative)</small></label>
-      <input type="range" id="denoise" min="0.10" max="1.0" step="0.05" value="0.65">
-    </div>
-    <div class="row" style="margin-top:8px">
-      <div><label for="seed">Seed</label><input type="number" id="seed" min="0"></div>
-      <label class="chk" style="margin-top:22px"><input type="checkbox" id="rand" checked><span>Random</span></label>
-    </div>
-    <details id="advanced-settings" style="margin-top:10px">
-      <summary style="font-weight:600;font-size:12px;color:var(--txt)">⚙️ Model & Sampler Settings</summary>
-      <div style="margin-top:8px">
-        <div class="row">
-          <div><label for="aspect">Aspect</label><select id="aspect"></select></div>
-          <div><label for="ckpt">Checkpoint</label><select id="ckpt"></select></div>
-        </div>
-        <div class="lora-box">
+      <div class="row" style="margin-top:8px">
+        <div><label for="seed">Seed</label><input type="number" id="seed" min="0"></div>
+        <label class="chk" style="margin-top:22px"><input type="checkbox" id="rand" checked><span>Random</span></label>
+      </div>
+      <details id="advanced-settings" style="margin-top:10px">
+        <summary style="font-weight:600;font-size:12px;color:var(--txt)">⚙️ Model & Sampler Settings</summary>
+        <div style="margin-top:8px">
           <div class="row">
-            <div><label for="lora1">LoRA 1</label><select id="lora1"></select></div>
-            <div><label for="lora1_str">Strength</label><input type="number" id="lora1_str" min="-2" max="2" step="0.05" value="1.0"></div>
+            <div><label for="aspect">Aspect</label><select id="aspect"></select></div>
+            <div><label for="ckpt">Checkpoint</label><select id="ckpt"></select></div>
           </div>
-          <div class="row" style="margin-top:6px">
-            <div><label for="lora2">LoRA 2</label><select id="lora2"></select></div>
-            <div><label for="lora2_str">Strength</label><input type="number" id="lora2_str" min="-2" max="2" step="0.05" value="1.0"></div>
-          </div>
-        </div>
-        <label for="mp" style="margin-top:8px">Megapixels: <b id="mpv"></b></label><input type="range" id="mp" min="0.25" max="4" step="0.05">
-        <div class="row">
-          <div><label for="steps">Steps</label><input type="number" id="steps" min="1" max="150"></div>
-          <div><label for="cfg">CFG</label><input type="number" id="cfg" min="0" max="30" step="0.1"></div>
-        </div>
-        <div class="row">
-          <div><label for="sampler">Sampler</label><select id="sampler"></select></div>
-          <div><label for="scheduler">Scheduler</label><select id="scheduler"></select></div>
-        </div>
-        <label class="chk" style="margin-top:8px"><input type="checkbox" id="upsampler"><span>Prompt upsampler<small>Expand captions</small></span></label>
-        <label class="chk"><input type="checkbox" id="slg"><span>Skip-layer guidance<small>Layer 22 details</small></span></label>
-        <details id="downloader-box" style="margin-top:10px;background:#11131a;border:1px solid var(--line);border-radius:8px;padding:8px">
-          <summary style="font-weight:600;font-size:11px;color:var(--acc);cursor:pointer;user-select:none">📥 Download Extra Model / LoRA</summary>
-          <div style="margin-top:8px">
-            <label for="dl-url" style="margin-top:0">Model or LoRA URL / Civitai AIR</label>
-            <input type="text" id="dl-url" placeholder="https://civitai.com/... or urn:air:... or huggingface.co/..." style="font-size:12px;padding:6px 8px">
+          <div class="lora-box">
+            <div class="row">
+              <div><label for="lora1">LoRA 1</label><select id="lora1"></select></div>
+              <div><label for="lora1_str">Strength</label><input type="number" id="lora1_str" min="-2" max="2" step="0.05" value="1.0"></div>
+            </div>
             <div class="row" style="margin-top:6px">
-              <div>
-                <label for="dl-type">Save as</label>
-                <select id="dl-type" style="font-size:12px;padding:6px 8px">
-                  <option value="auto">Auto-Detect</option>
-                  <option value="lora">LoRA</option>
-                  <option value="checkpoint">Checkpoint / Model</option>
-                </select>
-              </div>
-              <div>
-                <label for="dl-key">Civitai Key (optional)</label>
-                <input type="password" id="dl-key" placeholder="API key if restricted" style="font-size:12px;padding:6px 8px">
-              </div>
+              <div><label for="lora2">LoRA 2</label><select id="lora2"></select></div>
+              <div><label for="lora2_str">Strength</label><input type="number" id="lora2_str" min="-2" max="2" step="0.05" value="1.0"></div>
             </div>
-            <div style="margin-top:8px">
-              <button type="button" id="dl-btn" style="width:100%;padding:8px 12px;font-size:12px;background:linear-gradient(135deg,var(--acc),var(--acc2))">⬇️ Download to WebUI</button>
-            </div>
-            <div id="dl-status" style="margin-top:6px;font-size:11px;color:var(--mut);min-height:16px;word-break:break-all"></div>
           </div>
-        </details>
+          <label for="mp" style="margin-top:8px">Megapixels: <b id="mpv"></b></label><input type="range" id="mp" min="0.25" max="4" step="0.05">
+          <div class="row">
+            <div><label for="steps">Steps</label><input type="number" id="steps" min="1" max="150"></div>
+            <div><label for="cfg">CFG</label><input type="number" id="cfg" min="0" max="30" step="0.1"></div>
+          </div>
+          <div class="row">
+            <div><label for="sampler">Sampler</label><select id="sampler"></select></div>
+            <div><label for="scheduler">Scheduler</label><select id="scheduler"></select></div>
+          </div>
+          <label class="chk" style="margin-top:8px"><input type="checkbox" id="upsampler"><span>Prompt upsampler<small>Expand captions</small></span></label>
+          <label class="chk"><input type="checkbox" id="slg"><span>Skip-layer guidance<small>Layer 22 details</small></span></label>
+        </div>
+      </details>
+      <label class="chk" style="margin-top:10px;font-size:12px"><input type="checkbox" id="notif" checked><span>🔔 Chime alert <a href="#" id="test-sound" style="color:var(--acc);text-decoration:underline;margin-left:4px;">(test)</a></span></label>
+    </div>
+
+    <!-- TAB 2: DOWNLOADER -->
+    <div id="tab-dl" style="display:none">
+      <div style="background:#11131a;border:1px solid var(--line);border-radius:10px;padding:12px">
+        <div style="font-weight:700;font-size:13px;color:var(--txt);margin-bottom:4px">📥 Download Models & LoRAs</div>
+        <div style="font-size:11px;color:var(--mut);margin-bottom:12px">Download extra diffusion models or LoRAs directly from Civitai, Hugging Face, or Google Drive into ComfyUI.</div>
+
+        <label for="dl-url" style="margin-top:0">Model / LoRA URL or Civitai AIR</label>
+        <input type="text" id="dl-url" placeholder="https://civitai.com/... or urn:air:... or huggingface.co/..." style="font-size:12px;padding:8px">
+
+        <div class="row" style="margin-top:8px">
+          <div>
+            <label for="dl-type">Save as</label>
+            <select id="dl-type" style="font-size:12px;padding:8px">
+              <option value="auto">Auto-Detect</option>
+              <option value="lora">LoRA</option>
+              <option value="checkpoint">Checkpoint / Model</option>
+            </select>
+          </div>
+          <div>
+            <label for="dl-key">Civitai Key (optional)</label>
+            <input type="password" id="dl-key" placeholder="API key if restricted" style="font-size:12px;padding:8px">
+          </div>
+        </div>
+
+        <div style="margin-top:12px">
+          <button type="button" id="dl-btn" style="width:100%;padding:10px;font-size:13px;background:linear-gradient(135deg,var(--acc),var(--acc2));border-radius:8px">⬇️ Download to WebUI</button>
+        </div>
+
+        <div id="dl-status" style="margin-top:8px;font-size:12px;color:var(--mut);min-height:20px;word-break:break-all;line-height:1.4"></div>
       </div>
-    </details>
-    <label class="chk" style="margin-top:10px;font-size:12px"><input type="checkbox" id="notif" checked><span>🔔 Chime alert <a href="#" id="test-sound" style="color:var(--acc);text-decoration:underline;margin-left:4px;">(test)</a></span></label>
+
+      <div style="margin-top:12px;background:rgba(255,255,255,0.02);border:1px solid var(--line);border-radius:8px;padding:10px;font-size:11px;color:var(--mut);line-height:1.5">
+        <b style="color:var(--txt)">💡 Supported formats:</b>
+        <ul style="margin:6px 0 0;padding-left:16px">
+          <li><b>Civitai:</b> Model page URL (e.g. <code>civitai.com/models/...</code>) or mirror <code>civitai.red</code></li>
+          <li><b>Civitai AIR:</b> <code>urn:air:mossimage:checkpoint:...</code></li>
+          <li><b>Hugging Face:</b> Direct model links (auto-converts <code>/blob/</code>)</li>
+          <li><b>Google Drive:</b> Shared file or folder links</li>
+        </ul>
+      </div>
+    </div>
   </section>
   <section class="panel">
     <div id="stage"><span id="placeholder">Your image will appear here</span></div>
@@ -1419,6 +1450,30 @@ async function init(){
   }
 }
 $("#mp").addEventListener("input", e => $("#mpv").textContent = (+e.target.value).toFixed(2));
+    const tabGenBtn = $("#tab-btn-gen");
+  const tabDlBtn = $("#tab-btn-dl");
+  const tabGen = $("#tab-gen");
+  const tabDl = $("#tab-dl");
+
+  function switchTab(t) {
+    if (t === "dl") {
+      tabDlBtn.classList.add("active");
+      tabGenBtn.classList.remove("active");
+      tabDl.style.display = "block";
+      tabGen.style.display = "none";
+    } else {
+      tabGenBtn.classList.add("active");
+      tabDlBtn.classList.remove("active");
+      tabGen.style.display = "block";
+      tabDl.style.display = "none";
+    }
+  }
+
+  if (tabGenBtn && tabDlBtn) {
+    tabGenBtn.addEventListener("click", () => switchTab("gen"));
+    tabDlBtn.addEventListener("click", () => switchTab("dl"));
+  }
+
   const dlBtn = $("#dl-btn");
   const dlUrlInput = $("#dl-url");
   const dlTypeSelect = $("#dl-type");
