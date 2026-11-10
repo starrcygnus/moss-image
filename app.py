@@ -418,6 +418,7 @@ def build_workflow(p):
                 "vae": ["18:3", 0],
                 "edit_format": "ai-toolkit",
                 "image_strength": 1.0,
+                "images.image_0": ctrl_img_link,
                 "image_0": ctrl_img_link
             },
             "class_type": "TextEncodeMOSSImageEdit",
@@ -430,6 +431,7 @@ def build_workflow(p):
                 "vae": ["18:3", 0],
                 "edit_format": "ai-toolkit",
                 "image_strength": 1.0,
+                "images.image_0": ctrl_img_link,
                 "image_0": ctrl_img_link
             },
             "class_type": "TextEncodeMOSSImageEdit",
@@ -771,7 +773,10 @@ def generate():
         return jsonify(error=f"Backend is not reachable: {e}"), 502
     if r.status_code != 200:
         return jsonify(error=explain_validation(r)), 400
-    prompt_id = r.json()["prompt_id"]
+    resp_data = r.json()
+    if resp_data.get("node_errors"):
+        return jsonify(error=explain_validation(r)), 400
+    prompt_id = resp_data["prompt_id"]
     JOB_PARAMS[prompt_id] = {"params": p, "seed": seed, "workflow": wf}
     return jsonify(prompt_id=prompt_id, seed=seed)
 
