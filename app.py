@@ -456,57 +456,80 @@ def get_florence():
     global _florence_model, _florence_processor
     if _florence_model is None:
         import torch
-        from transformers import AutoConfig, AutoModelForCausalLM, AutoProcessor
-        from unittest.mock import patch
-        from transformers.dynamic_module_utils import get_imports
-
-        def fixed_get_imports(filename):
-            if not str(filename).endswith("modeling_florence2.py"):
-                return get_imports(filename)
-            imports = get_imports(filename)
-            if "flash_attn" in imports:
-                imports.remove("flash_attn")
-            return imports
-
-        model_id = "microsoft/Florence-2-base"
+        from transformers import AutoProcessor
         device = "cuda" if torch.cuda.is_available() else "cpu"
         dtype = torch.float16 if device == "cuda" else torch.float32
 
-        print(f"Loading {model_id} on {device} ({dtype})...")
-        config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
-        if hasattr(config, "text_config"):
-            config.text_config.forced_bos_token_id = None
-            try:
-                type(config.text_config).forced_bos_token_id = None
-            except Exception:
-                pass
+        loaded = False
+        # Try native Florence2ForConditionalGeneration first (native in modern transformers)
         try:
-            type(config).forced_bos_token_id = None
-        except Exception:
-            pass
-
-        with patch("transformers.dynamic_module_utils.get_imports", fixed_get_imports):
-            _florence_model = AutoModelForCausalLM.from_pretrained(
-                model_id,
-                config=config,
-                torch_dtype=dtype,
-                trust_remote_code=True
+            from transformers import Florence2ForConditionalGeneration
+            print("Loading Florence2ForConditionalGeneration from florence-community/Florence-2-base...")
+            _florence_model = Florence2ForConditionalGeneration.from_pretrained(
+                "florence-community/Florence-2-base",
+                torch_dtype=dtype
             ).to(device).eval()
-            _florence_processor = AutoProcessor.from_pretrained(
-                model_id,
-                trust_remote_code=True
-            )
+            _florence_processor = AutoProcessor.from_pretrained("florence-community/Florence-2-base")
+            loaded = True
+            print("✓ Native Florence-2 loaded successfully.")
+        except Exception as e:
+            print(f"Native loader skipped ({e}), falling back to AutoModel...")
 
-        if hasattr(_florence_model.config, "text_config"):
-            _florence_model.config.text_config.forced_bos_token_id = None
-            try:
-                type(_florence_model.config.text_config).forced_bos_token_id = None
-            except Exception:
-                pass
-        if hasattr(_florence_model, "generation_config") and _florence_model.generation_config is not None:
-            _florence_model.generation_config.forced_bos_token_id = None
+        if not loaded:
+            from transformers import AutoConfig, AutoModelForCausalLM
+            from unittest.mock import patch
+            from transformers.dynamic_module_utils import get_imports
 
-        print(f"✓ {model_id} loaded successfully.")
+            def fixed_get_imports(filename):
+                if not str(filename).endswith("modeling_florence2.py"):
+                    return get_imports(filename)
+                imports = get_imports(filename)
+                if "flash_attn" in imports:
+                    imports.remove("flash_attn")
+                return imports
+
+            for model_id in ["florence-community/Florence-2-base", "microsoft/Florence-2-base"]:
+                try:
+                    print(f"Loading {model_id} on {device} ({dtype})...")
+                    config = AutoConfig.from_pretrained(model_id, trust_remote_code=True)
+                    if hasattr(config, "text_config"):
+                        setattr(config.text_config, "forced_bos_token_id", None)
+                        try:
+                            setattr(type(config.text_config), "forced_bos_token_id", None)
+                        except Exception:
+                            pass
+                    try:
+                        setattr(type(config), "forced_bos_token_id", None)
+                    except Exception:
+                        pass
+
+                    with patch("transformers.dynamic_module_utils.get_imports", fixed_get_imports):
+                        _florence_model = AutoModelForCausalLM.from_pretrained(
+                            model_id,
+                            config=config,
+                            torch_dtype=dtype,
+                            trust_remote_code=True
+                        ).to(device).eval()
+                        _florence_processor = AutoProcessor.from_pretrained(
+                            model_id,
+                            trust_remote_code=True
+                        )
+                    print(f"✓ {model_id} loaded successfully.")
+                    break
+                except Exception as err:
+                    print(f"Failed loading {model_id}: {err}")
+
+        # Ensure forced_bos_token_id is safely set to None on any config object
+        if _florence_model is not None:
+            if hasattr(_florence_model.config, "text_config"):
+                setattr(_florence_model.config.text_config, "forced_bos_token_id", None)
+                try:
+                    setattr(type(_florence_model.config.text_config), "forced_bos_token_id", None)
+                except Exception:
+                    pass
+            if hasattr(_florence_model, "generation_config") and _florence_model.generation_config is not None:
+                setattr(_florence_model.generation_config, "forced_bos_token_id", None)
+
     return _florence_model, _florence_processor
 
 @app.post("/api/describe")
