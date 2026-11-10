@@ -64,8 +64,14 @@ def embed_png_metadata(img_path, meta_info, final_caption):
         if p.get("slg"):
             param_parts.append("Skip-Layer Guidance: True")
         if p.get("input_image"):
-            param_parts.append(f"Denoise: {p.get('denoise', 0.65)}")
+            c_mode = p.get("control_mode", "img2img")
+            param_parts.append(f"Mode: {c_mode}")
             param_parts.append(f"Input image: {p.get('input_image')}")
+            if c_mode == "control":
+                param_parts.append(f"Control Type: {p.get('control_type', 'auto')}")
+                param_parts.append(f"Control LoRA: {p.get('control_lora', 'None')} ({p.get('control_strength', 1.0)})")
+            else:
+                param_parts.append(f"Denoise: {p.get('denoise', 0.65)}")
 
         lines.append(", ".join(param_parts))
         a1111_params = "\n".join(lines)
@@ -147,6 +153,10 @@ DEFAULTS = {
     "lora2_strength": 1.0,
     "lora3": "None",
     "lora3_strength": 1.0,
+    "control_mode": "img2img",
+    "control_type": "auto",
+    "control_lora": "None",
+    "control_strength": 1.0,
 }
 
 app = Flask(__name__)
@@ -265,9 +275,128 @@ def build_workflow(p):
     ks["sampler_name"] = p.get("sampler") or DEFAULTS["sampler"]
     ks["scheduler"] = p.get("scheduler") or DEFAULTS["scheduler"]
 
-    # Img2Img or Text2Image routing
+    # Routing between Text-to-Image, Classic Img2Img, and Control LoRA
+    active_tab = p.get("tab", "gen")
     input_img = (p.get("input_image") or "").strip()
-    if input_img:
+    c_mode = p.get("control_mode", "img2img")
+
+    if active_tab == "img2img" and input_img and c_mode == "control":
+        # Control LoRA Mode (uses TextEncodeMOSSImageEdit)
+        ctrl_lora = p.get("control_lora", "None")
+        ctrl_str = float(p.get("control_strength", 1.0))
+        ctrl_type = str(p.get("control_type", "auto")).lower()
+
+        if ctrl_type == "auto":
+            l_lower = ctrl_lora.lower()
+            if any(k in l_lower for k in ("pose", "openpose", "dwpose")):
+                ctrl_type = "pose"
+            elif "depth" in l_lower:
+                ctrl_type = "depth"
+            elif any(k in l_lower for k in ("canny", "edge")):
+                ctrl_type = "canny"
+            else:
+                ctrl_type = "direct"
+
+        wf["input_load"] = {
+            "inputs": {"image": input_img},
+            "class_type": "LoadImage",
+            "_meta": {"title": "Load Reference Image"}
+        }
+
+        # Apply Preprocessor
+        if ctrl_type == "pose":
+            wf["ctrl_preprocess"] = {
+                "inputs": {
+                    "image": ["input_load", 0],
+                    "detect_hand": "enable",
+                    "detect_body": "enable",
+                    "detect_face": "enable",
+                    "resolution": 1024,
+                    "bbox_detector": "yolox_l.onnx",
+                    "pose_estimator": "dw-ll_ucoco_384_bs5.torchscript.pt"
+                },
+                "class_type": "DWPreprocessor",
+                "_meta": {"title": "DWPose Skeleton Extractor"}
+            }
+            ctrl_img_link = ["ctrl_preprocess", 0]
+        elif ctrl_type == "depth":
+            wf["ctrl_preprocess"] = {
+                "inputs": {
+                    "image": ["input_load", 0],
+                    "ckpt_name": "depth_anything_v2_vitl.pth",
+                    "resolution": 1024
+                },
+                "class_type": "DepthAnythingV2Preprocessor",
+                "_meta": {"title": "Depth Anything V2 Extractor"}
+            }
+            ctrl_img_link = ["ctrl_preprocess", 0]
+        elif ctrl_type == "canny":
+            wf["ctrl_preprocess"] = {
+                "inputs": {
+                    "image": ["input_load", 0],
+                    "low_threshold": 0.4,
+                    "high_threshold": 0.8
+                },
+                "class_type": "Canny",
+                "_meta": {"title": "Canny Edge Extractor"}
+            }
+            ctrl_img_link = ["ctrl_preprocess", 0]
+        else:
+            ctrl_img_link = ["input_load", 0]
+
+        # Attach Control LoRA to model chain
+        if ctrl_lora and ctrl_lora != "None" and ctrl_str != 0:
+            wf["lora_ctrl"] = {
+                "inputs": {
+                    "lora_name": ctrl_lora,
+                    "strength_model": ctrl_str,
+                    "strength_clip": ctrl_str,
+                    "model": curr_model,
+                    "clip": curr_clip
+                },
+                "class_type": "LoraLoader",
+                "_meta": {"title": f"Control LoRA ({ctrl_lora})"}
+            }
+            curr_model = ["lora_ctrl", 0]
+            curr_clip = ["lora_ctrl", 1]
+
+        # Connect TextEncodeMOSSImageEdit for Positive and Negative conditionings
+        prompt_input = ["18:16", 0] if wf["18:16"]["inputs"]["switch"] else (p.get("prompt") or "")
+        wf["ctrl_encode_pos"] = {
+            "inputs": {
+                "prompt": prompt_input,
+                "clip": curr_clip,
+                "vae": ["18:3", 0],
+                "edit_format": "ai-toolkit",
+                "image_strength": 1.0,
+                "image_0": ctrl_img_link
+            },
+            "class_type": "TextEncodeMOSSImageEdit",
+            "_meta": {"title": "Text Encode MOSS-Image Edit (positive)"}
+        }
+        wf["ctrl_encode_neg"] = {
+            "inputs": {
+                "prompt": p.get("negative") or "",
+                "clip": curr_clip,
+                "vae": ["18:3", 0],
+                "edit_format": "ai-toolkit",
+                "image_strength": 1.0,
+                "image_0": ctrl_img_link
+            },
+            "class_type": "TextEncodeMOSSImageEdit",
+            "_meta": {"title": "Text Encode MOSS-Image Edit (negative)"}
+        }
+
+        # KSampler uses empty latent + 1.0 denoise for full generative structure
+        ks["latent_image"] = ["18:6", 0]
+        ks["denoise"] = 1.0
+        ks["positive"] = ["ctrl_encode_pos", 0]
+        ks["negative"] = ["ctrl_encode_neg", 0]
+        if "cfg" not in p or p.get("cfg") == DEFAULTS["cfg"]:
+            ks["cfg"] = 4.0
+
+    elif active_tab == "img2img" and input_img:
+        # Classic img2img Mode
         denoise_val = clamp(p.get("denoise", 0.65), 0.05, 1.0, float, 0.65)
         wf["input_load"] = {
             "inputs": {"image": input_img},
@@ -282,6 +411,7 @@ def build_workflow(p):
         ks["latent_image"] = ["input_encode", 0]
         ks["denoise"] = denoise_val
     else:
+        # Pure Text-to-Image Mode
         ks["latent_image"] = ["18:6", 0]
         ks["denoise"] = 1.0
 
@@ -1084,36 +1214,15 @@ h3{font-size:13px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px;
     <div class="btns btns-top"><button id="go">✨ Generate</button><div class="batch-box"><label for="batch">Images</label><input type="number" id="batch" min="1" max="10" value="1" title="How many images to generate (e.g. 2 for 2 variations)"></div><button id="stop" class="ghost" hidden>Cancel</button></div>
     
     <div class="tab-bar">
-      <button type="button" class="tab-btn active" id="tab-btn-gen">🎨 Generation</button>
+      <button type="button" class="tab-btn active" id="tab-btn-gen">🎨 Text-to-Image</button>
+      <button type="button" class="tab-btn" id="tab-btn-img2img">🖼️ Img2Img & Control</button>
       <button type="button" class="tab-btn" id="tab-btn-dl">📥 Downloader</button>
     </div>
 
-    <!-- TAB 1: GENERATION -->
+    <!-- TAB 1: TEXT-TO-IMAGE -->
     <div id="tab-gen">
       <label for="prompt">Prompt</label><textarea id="prompt" rows="4" placeholder="Describe the image you want to generate..."></textarea>
       <label for="negative">Negative prompt</label><textarea id="negative" rows="1" placeholder="worst quality, bad anatomy..."></textarea>
-      <div class="dropzone" id="dropzone">
-        <input type="file" id="file-input" accept="image/png,image/jpeg,image/webp" hidden>
-        <div id="drop-empty" class="dropzone-empty">
-          <span style="font-size:18px">🖼️</span>
-          <div><b>img2img</b> (drop/browse)<br><small style="font-size:10px;color:var(--mut)">Leave empty for text-to-image</small></div>
-        </div>
-        <div id="drop-filled" class="dropzone-preview" hidden>
-          <img id="drop-thumb" alt="Preview">
-          <div class="dropzone-info">
-            <div class="fn" id="drop-fname">photo.png</div>
-            <div id="drop-meta-badge" class="meta-badge" hidden>✨ Embedded prompt loaded</div>
-          </div>
-          <div class="drop-actions">
-            <button type="button" id="drop-describe" class="btn-describe" title="Analyze image and generate prompt with Florence-2">🔍 AI Describe</button>
-            <button type="button" id="drop-clear" class="ghost-sm" title="Remove reference image">✕ Remove</button>
-          </div>
-        </div>
-      </div>
-      <div id="denoise-row" style="margin-top:8px;display:none">
-        <label for="denoise">Denoise: <b id="denoise-val">0.65</b><small style="display:inline;margin-left:6px;font-size:10px;color:var(--mut)">(0.35=keep, 0.70=creative)</small></label>
-        <input type="range" id="denoise" min="0.10" max="1.0" step="0.05" value="0.65">
-      </div>
       <div class="row" style="margin-top:8px">
         <div><label for="seed">Seed</label><input type="number" id="seed" min="0"></div>
         <label class="chk" style="margin-top:22px"><input type="checkbox" id="rand" checked><span>Random</span></label>
@@ -1153,6 +1262,81 @@ h3{font-size:13px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px;
         </div>
       </details>
       <label class="chk" style="margin-top:10px;font-size:12px"><input type="checkbox" id="notif" checked><span>🔔 Chime alert <a href="#" id="test-sound" style="color:var(--acc);text-decoration:underline;margin-left:4px;">(test)</a></span></label>
+    </div>
+
+    <!-- TAB 2: IMG2IMG & CONTROL -->
+    <div id="tab-img2img" style="display:none">
+      <div class="dropzone" id="dropzone" style="margin-top:0">
+        <input type="file" id="file-input" accept="image/png,image/jpeg,image/webp" hidden>
+        <div id="drop-empty" class="dropzone-empty">
+          <span style="font-size:22px">🖼️</span>
+          <div><b>Drop Reference Image or Control Map</b><br><small style="font-size:11px;color:var(--mut)">Supports photos, pose skeletons, depth maps, or sketches</small></div>
+        </div>
+        <div id="drop-filled" class="dropzone-preview" hidden>
+          <img id="drop-thumb" alt="Preview">
+          <div class="dropzone-info">
+            <div class="fn" id="drop-fname">photo.png</div>
+            <div id="drop-meta-badge" class="meta-badge" hidden>✨ Embedded prompt loaded</div>
+          </div>
+          <div class="drop-actions">
+            <button type="button" id="drop-describe" class="btn-describe" title="Analyze image and generate prompt with Florence-2">🔍 AI Describe</button>
+            <button type="button" id="drop-clear" class="ghost-sm" title="Remove reference image">✕ Remove</button>
+          </div>
+        </div>
+      </div>
+
+      <!-- Mode Selector -->
+      <div style="margin-top:10px;background:#11131a;border:1px solid var(--line);border-radius:10px;padding:10px">
+        <div style="font-size:11px;font-weight:700;color:var(--txt);text-transform:uppercase;letter-spacing:.5px;margin-bottom:8px">Image Guidance Mode</div>
+        <div style="display:flex;gap:8px">
+          <button type="button" id="mode-btn-i2i" class="tab-btn active" style="flex:1;border:1px solid var(--acc)">🔄 Classic img2img</button>
+          <button type="button" id="mode-btn-ctrl" class="tab-btn" style="flex:1;border:1px solid var(--line)">🎛️ ControlNet (LoRA)</button>
+        </div>
+
+        <!-- Classic img2img Controls -->
+        <div id="panel-mode-i2i" style="margin-top:10px">
+          <label for="denoise" style="margin-top:0">Denoise: <b id="denoise-val">0.65</b> <small style="display:inline;margin-left:6px;font-size:10px;color:var(--mut)">(0.35=keep source, 0.70=creative)</small></label>
+          <input type="range" id="denoise" min="0.10" max="1.0" step="0.05" value="0.65">
+        </div>
+
+        <!-- ControlNet Controls -->
+        <div id="panel-mode-ctrl" style="margin-top:10px;display:none">
+          <div class="row">
+            <div>
+              <label for="ctrl-type" style="margin-top:0">Preprocessor</label>
+              <select id="ctrl-type" style="font-size:12px;padding:8px">
+                <option value="auto">Auto (Detect from LoRA)</option>
+                <option value="pose">🦴 Pose (DWPose Skeleton)</option>
+                <option value="depth">🏔️ Depth (Depth Anything V2)</option>
+                <option value="canny">🖋️ Canny (Edge Outlines)</option>
+                <option value="direct">🎯 Direct (Already Control Map)</option>
+              </select>
+            </div>
+            <div>
+              <label for="ctrl-str" style="margin-top:0">Control Strength</label>
+              <input type="number" id="ctrl-str" min="-2" max="2" step="0.05" value="1.0" style="font-size:12px;padding:8px">
+            </div>
+          </div>
+          <div style="margin-top:8px">
+            <label for="ctrl-lora">Control LoRA</label>
+            <select id="ctrl-lora" style="font-size:12px;padding:8px"></select>
+          </div>
+          <div id="ctrl-hint" style="font-size:11px;color:var(--acc);margin-top:6px;line-height:1.4">
+            💡 Auto: auto-detects pose, depth, or canny from the selected Control LoRA.
+          </div>
+        </div>
+      </div>
+
+      <label for="prompt-i2i" style="margin-top:10px">Prompt</label><textarea id="prompt-i2i" rows="3" placeholder="Describe how you want to transform or style the image..."></textarea>
+      <label for="negative-i2i">Negative prompt</label><textarea id="negative-i2i" rows="1" placeholder="worst quality, bad anatomy..."></textarea>
+
+      <div class="row" style="margin-top:8px">
+        <div><label for="seed-i2i">Seed</label><input type="number" id="seed-i2i" min="0"></div>
+        <label class="chk" style="margin-top:22px"><input type="checkbox" id="rand-i2i" checked><span>Random</span></label>
+      </div>
+      <div style="margin-top:10px;font-size:11px;color:var(--mut)">
+        ℹ️ Uses the Checkpoint, LoRA, and Sampler settings configured in the drawer.
+      </div>
     </div>
 
     <!-- TAB 2: DOWNLOADER -->
@@ -1215,28 +1399,46 @@ function fill(sel, items, value){
   if (value !== undefined) el.value = value;
 }
 function setSettings(s){
-  $("#prompt").value = s.prompt; $("#negative").value = s.negative;
+  $("#prompt").value = s.prompt || "";
+  if ($("#prompt-i2i")) $("#prompt-i2i").value = s.prompt || "";
+  $("#negative").value = s.negative || "";
+  if ($("#negative-i2i")) $("#negative-i2i").value = s.negative || "";
   $("#aspect").value = s.aspect_ratio; $("#ckpt").value = s.checkpoint;
   $("#lora1").value = s.lora1 || "None"; $("#lora1_str").value = s.lora1_strength ?? 1.0;
   $("#lora2").value = s.lora2 || "None"; $("#lora2_str").value = s.lora2_strength ?? 1.0;
   $("#lora3").value = s.lora3 || "None"; $("#lora3_str").value = s.lora3_strength ?? 1.0;
+  if ($("#ctrl-lora")) $("#ctrl-lora").value = s.control_lora || "None";
+  if ($("#ctrl-str")) $("#ctrl-str").value = s.control_strength ?? 1.0;
+  if ($("#ctrl-type")) $("#ctrl-type").value = s.control_type || "auto";
   $("#mp").value = s.megapixels; $("#mpv").textContent = (+s.megapixels).toFixed(2);
   $("#steps").value = s.steps; $("#cfg").value = s.cfg;
   $("#sampler").value = s.sampler; $("#scheduler").value = s.scheduler;
   $("#upsampler").checked = !!s.upsampler; $("#slg").checked = !!s.slg;
 }
 function getSettings(){
+  const isI2I = window._activeTab === "img2img";
+  const pVal = isI2I ? ($("#prompt-i2i") ? $("#prompt-i2i").value : $("#prompt").value) : $("#prompt").value;
+  const nVal = isI2I ? ($("#negative-i2i") ? $("#negative-i2i").value : $("#negative").value) : $("#negative").value;
+  const isRand = isI2I ? ($("#rand-i2i") ? $("#rand-i2i").checked : true) : $("#rand").checked;
+  const sEl = isI2I ? $("#seed-i2i") : $("#seed");
+  const sVal = isRand ? -1 : parseInt((sEl ? sEl.value : "") || "0", 10);
+
   return {
-    prompt: $("#prompt").value, negative: $("#negative").value,
+    tab: window._activeTab || "gen",
+    prompt: pVal, negative: nVal,
     aspect_ratio: $("#aspect").value, checkpoint: $("#ckpt").value,
     lora1: $("#lora1").value, lora1_strength: parseFloat($("#lora1_str").value) || 0,
     lora2: $("#lora2").value, lora2_strength: parseFloat($("#lora2_str").value) || 0,
     lora3: $("#lora3").value, lora3_strength: parseFloat($("#lora3_str").value) || 0,
     megapixels: parseFloat($("#mp").value), steps: parseInt($("#steps").value, 10),
     cfg: parseFloat($("#cfg").value), sampler: $("#sampler").value, scheduler: $("#scheduler").value,
-    seed: $("#rand").checked ? -1 : parseInt($("#seed").value || "0", 10),
+    seed: sVal,
     upsampler: $("#upsampler").checked, slg: $("#slg").checked,
-    input_image: window._inputImage || null,
+    input_image: isI2I ? (window._inputImage || null) : null,
+    control_mode: window._controlMode || "img2img",
+    control_type: $("#ctrl-type") ? $("#ctrl-type").value : "auto",
+    control_lora: $("#ctrl-lora") ? $("#ctrl-lora").value : "None",
+    control_strength: parseFloat($("#ctrl-str") ? $("#ctrl-str").value : "1.0") || 1.0,
     denoise: parseFloat($("#denoise") ? $("#denoise").value : "0.65") || 0.65
   };
 }
@@ -1389,6 +1591,7 @@ async function generate(){
     Notification.requestPermission();
   }
   const s = getSettings();
+  if (s.tab === "img2img" && !s.input_image) { say("⚠️ Please drop or select a reference image for Img2Img / Control mode!", true); return; }
   if (!s.prompt.trim()) { say("Please enter a prompt.", true); return; }
 
   const count = Math.max(1, Math.min(10, parseInt($("#batch") ? $("#batch").value : "1", 10) || 1));
@@ -1453,6 +1656,11 @@ async function init(){
   const d = o.defaults;
   fill("#aspect", o.aspect_ratios, d.aspect_ratio); fill("#ckpt", o.checkpoints, d.checkpoint);
   fill("#lora1", o.loras, d.lora1); fill("#lora2", o.loras, d.lora2); fill("#lora3", o.loras, d.lora3);
+  fill("#ctrl-lora", o.loras, d.control_lora || "None");
+  if ($("#ctrl-lora").value === "None" && o.loras) {
+    const found = o.loras.find(l => /control|pose|depth|canny/i.test(l));
+    if (found) $("#ctrl-lora").value = found;
+  }
   const checkTurbo = e => {
     if (e.target.value && e.target.value.toLowerCase().includes("8-step")) {
       $("#steps").value = 8;
@@ -1495,28 +1703,71 @@ async function init(){
   }
 }
 $("#mp").addEventListener("input", e => $("#mpv").textContent = (+e.target.value).toFixed(2));
-    const tabGenBtn = $("#tab-btn-gen");
+  window._activeTab = "gen";
+  window._controlMode = "img2img";
+
+  const tabGenBtn = $("#tab-btn-gen");
+  const tabI2iBtn = $("#tab-btn-img2img");
   const tabDlBtn = $("#tab-btn-dl");
   const tabGen = $("#tab-gen");
+  const tabI2i = $("#tab-img2img");
   const tabDl = $("#tab-dl");
 
   function switchTab(t) {
-    if (t === "dl") {
-      tabDlBtn.classList.add("active");
-      tabGenBtn.classList.remove("active");
-      tabDl.style.display = "block";
-      tabGen.style.display = "none";
-    } else {
-      tabGenBtn.classList.add("active");
-      tabDlBtn.classList.remove("active");
-      tabGen.style.display = "block";
-      tabDl.style.display = "none";
-    }
+    window._activeTab = t;
+    if (tabGenBtn) tabGenBtn.classList.toggle("active", t === "gen");
+    if (tabI2iBtn) tabI2iBtn.classList.toggle("active", t === "img2img");
+    if (tabDlBtn) tabDlBtn.classList.toggle("active", t === "dl");
+    if (tabGen) tabGen.style.display = t === "gen" ? "block" : "none";
+    if (tabI2i) tabI2i.style.display = t === "img2img" ? "block" : "none";
+    if (tabDl) tabDl.style.display = t === "dl" ? "block" : "none";
   }
 
-  if (tabGenBtn && tabDlBtn) {
-    tabGenBtn.addEventListener("click", () => switchTab("gen"));
-    tabDlBtn.addEventListener("click", () => switchTab("dl"));
+  if (tabGenBtn) tabGenBtn.addEventListener("click", () => switchTab("gen"));
+  if (tabI2iBtn) tabI2iBtn.addEventListener("click", () => switchTab("img2img"));
+  if (tabDlBtn) tabDlBtn.addEventListener("click", () => switchTab("dl"));
+
+  // Sync prompts across tabs
+  $("#prompt").addEventListener("input", e => { if ($("#prompt-i2i")) $("#prompt-i2i").value = e.target.value; });
+  if ($("#prompt-i2i")) $("#prompt-i2i").addEventListener("input", e => { $("#prompt").value = e.target.value; });
+  $("#negative").addEventListener("input", e => { if ($("#negative-i2i")) $("#negative-i2i").value = e.target.value; });
+  if ($("#negative-i2i")) $("#negative-i2i").addEventListener("input", e => { $("#negative").value = e.target.value; });
+
+  // Control mode toggle
+  if ($("#mode-btn-i2i")) {
+    $("#mode-btn-i2i").addEventListener("click", () => {
+      window._controlMode = "img2img";
+      $("#mode-btn-i2i").classList.add("active");
+      $("#mode-btn-i2i").style.borderColor = "var(--acc)";
+      $("#mode-btn-ctrl").classList.remove("active");
+      $("#mode-btn-ctrl").style.borderColor = "var(--line)";
+      $("#panel-mode-i2i").style.display = "block";
+      $("#panel-mode-ctrl").style.display = "none";
+    });
+  }
+  if ($("#mode-btn-ctrl")) {
+    $("#mode-btn-ctrl").addEventListener("click", () => {
+      window._controlMode = "control";
+      $("#mode-btn-ctrl").classList.add("active");
+      $("#mode-btn-ctrl").style.borderColor = "var(--acc)";
+      $("#mode-btn-i2i").classList.remove("active");
+      $("#mode-btn-i2i").style.borderColor = "var(--line)";
+      $("#panel-mode-ctrl").style.display = "block";
+      $("#panel-mode-i2i").style.display = "none";
+    });
+  }
+
+  const ctrlHints = {
+    auto: "💡 Auto: auto-detects pose, depth, or canny from the selected Control LoRA.",
+    pose: "🦴 Pose: Upload any photo of a person. DWPose will auto-extract the skeleton.",
+    depth: "🏔️ Depth: Upload any scene or object. Depth Anything will compute 3D distances.",
+    canny: "🖋️ Canny: Upload any image. Canny will detect clean structural outlines.",
+    direct: "🎯 Direct: Upload a pre-made black & white skeleton, depth map, or edge drawing."
+  };
+  if ($("#ctrl-type")) {
+    $("#ctrl-type").addEventListener("change", e => {
+      $("#ctrl-hint").textContent = ctrlHints[e.target.value] || ctrlHints.auto;
+    });
   }
 
   const dlBtn = $("#dl-btn");
@@ -1555,9 +1806,11 @@ $("#mp").addEventListener("input", e => $("#mpv").textContent = (+e.target.value
               const curL1 = $("#lora1").value;
               const curL2 = $("#lora2").value;
               const curL3 = $("#lora3").value;
+              const curCtrl = $("#ctrl-lora") ? $("#ctrl-lora").value : "None";
               fill("#lora1", opts.loras, st.target_type === "lora" ? st.filename : curL1);
               fill("#lora2", opts.loras, curL2);
               fill("#lora3", opts.loras, curL3);
+              if ($("#ctrl-lora")) fill("#ctrl-lora", opts.loras, st.target_type === "lora" && /control|pose|depth|canny/i.test(st.filename) ? st.filename : curCtrl);
             }
             say(`🎉 New ${st.target_type || "model"} loaded and ready to use!`);
           });
@@ -1654,10 +1907,12 @@ $("#prompt").addEventListener("keydown", e => { if ((e.ctrlKey || e.metaKey) && 
         let loadedTags = [];
         if (m.prompt) {
           $("#prompt").value = m.prompt;
+          if ($("#prompt-i2i")) $("#prompt-i2i").value = m.prompt;
           loadedTags.push("prompt");
         }
         if (m.negative) {
           $("#negative").value = m.negative;
+          if ($("#negative-i2i")) $("#negative-i2i").value = m.negative;
           loadedTags.push("negative prompt");
         }
         if (m.seed !== undefined && m.seed !== null) {
@@ -1725,6 +1980,7 @@ $("#prompt").addEventListener("keydown", e => { if ((e.ctrlKey || e.metaKey) && 
           say("Florence-2 error: " + data.error, true);
         } else if (data.caption) {
           $("#prompt").value = data.caption;
+          if ($("#prompt-i2i")) $("#prompt-i2i").value = data.caption;
           mbEl.hidden = false;
           mbEl.textContent = "🔍 Florence-2 caption generated";
           say("✨ AI description generated and copied into Prompt!");
