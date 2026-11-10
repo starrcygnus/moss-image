@@ -717,6 +717,64 @@ DOWNLOAD_STATE = {
 }
 DOWNLOAD_LOCK = threading.Lock()
 
+def download_file_robust(final_url, dest_dir, fname, headers=None):
+    global DOWNLOAD_STATE
+    UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    cmd = [
+        "aria2c", "-x", "8", "-s", "8", "-k", "1M", "-c", "--file-allocation=none",
+        "--console-log-level=warn", "--summary-interval=1",
+        f"--user-agent={UA}",
+        "--header=Referer: https://civitai.com/",
+        "--check-certificate=false",
+        "-d", dest_dir, "-o", fname, final_url
+    ]
+    err_lines = []
+    aria_ok = False
+    try:
+        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
+        for line in proc.stdout:
+            line_str = line.strip()
+            if any(k in line_str for k in ["ERROR", "errorCode", "Exception", "failed"]):
+                err_lines.append(line_str)
+            m_pct = re.search(r'\((\d+)%\)', line_str)
+            if m_pct:
+                DOWNLOAD_STATE["percent"] = int(m_pct.group(1))
+            m_prog = re.search(r'(\d+(?:\.\d+)?[A-Za-z]+/\d+(?:\.\d+)?[A-Za-z]+\(\d+%\))', line_str)
+            m_spd = re.search(r'DL:([^\s]+)', line_str)
+            if m_prog:
+                DOWNLOAD_STATE["msg"] = f"Downloading: {m_prog.group(1)}" + (f" • {m_spd.group(1)}/s" if m_spd else "")
+            elif line_str:
+                DOWNLOAD_STATE["msg"] = line_str[:100]
+        proc.wait()
+        if proc.returncode == 0:
+            aria_ok = True
+        else:
+            print(f"aria2c returned code {proc.returncode}, fallback to direct streaming: {err_lines}")
+    except Exception as e:
+        print(f"aria2c execution error ({e}), fallback to direct streaming...")
+
+    if not aria_ok:
+        out_path = os.path.join(dest_dir, fname)
+        DOWNLOAD_STATE["msg"] = f"Streaming {fname} via direct connection..."
+        req_headers = {"User-Agent": UA, "Referer": "https://civitai.com/"}
+        if headers:
+            req_headers.update(headers)
+        with requests.get(final_url, headers=req_headers, stream=True, timeout=60) as r:
+            r.raise_for_status()
+            total_len = int(r.headers.get("content-length", 0))
+            dl_bytes = 0
+            with open(out_path, "wb") as f:
+                for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
+                    if chunk:
+                        f.write(chunk)
+                        dl_bytes += len(chunk)
+                        if total_len > 0:
+                            pct = int(dl_bytes / total_len * 100)
+                            DOWNLOAD_STATE["percent"] = pct
+                            DOWNLOAD_STATE["msg"] = f"Downloading: {dl_bytes // (1024*1024)}MB / {total_len // (1024*1024)}MB ({pct}%)"
+                        else:
+                            DOWNLOAD_STATE["msg"] = f"Downloading: {dl_bytes // (1024*1024)}MB"
+
 def run_download_task(raw_entry, target_type, civitai_key):
     global DOWNLOAD_STATE
     try:
@@ -809,7 +867,7 @@ def run_download_task(raw_entry, target_type, civitai_key):
             DOWNLOAD_STATE["msg"] = "Connecting to Civitai API..."
             parsed = urllib.parse.urlparse(url)
             qs = urllib.parse.parse_qs(parsed.query)
-            headers = {"User-Agent": "Mozilla/5.0"}
+            headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
             if civitai_key:
                 headers["Authorization"] = f"Bearer {civitai_key}"
 
@@ -853,11 +911,11 @@ def run_download_task(raw_entry, target_type, civitai_key):
                 sep = "&" if "?" in dl_url else "?"
                 dl_url = f"{dl_url}{sep}token={urllib.parse.quote(civitai_key)}"
 
-            resp = requests.get(dl_url, headers={"User-Agent": "Mozilla/5.0"}, allow_redirects=False, timeout=30)
+            resp = requests.get(dl_url, headers=headers, allow_redirects=False, timeout=30)
             if resp.status_code in (301, 302, 303, 307, 308) and "Location" in resp.headers:
                 final_url = resp.headers["Location"]
                 if "civitai.com/login" in final_url:
-                    raise RuntimeError("Civitai requires authentication for this model. Please enter your Civitai API Key.")
+                    raise RuntimeError("Civitai requires an API Key for this model. Please enter your Civitai API Key.")
                 if not fname:
                     fname = filename_from_headers(resp.headers, final_url)
             elif resp.status_code in (401, 403):
@@ -873,27 +931,8 @@ def run_download_task(raw_entry, target_type, civitai_key):
             fname = ensure_valid_ext(fname)
 
             DOWNLOAD_STATE["filename"] = fname
-            DOWNLOAD_STATE["msg"] = f"Starting aria2c download for {fname}..."
-            cmd = [
-                "aria2c", "-x", "16", "-s", "16", "-k", "1M", "-c", "--file-allocation=none",
-                "--console-log-level=warn", "--summary-interval=1",
-                "-d", dest_dir, "-o", fname, final_url
-            ]
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            for line in proc.stdout:
-                line_str = line.strip()
-                m_pct = re.search(r'\((\d+)%\)', line_str)
-                if m_pct:
-                    DOWNLOAD_STATE["percent"] = int(m_pct.group(1))
-                m_prog = re.search(r'(\d+(?:\.\d+)?[A-Za-z]+/\d+(?:\.\d+)?[A-Za-z]+\(\d+%\))', line_str)
-                m_spd = re.search(r'DL:([^\s]+)', line_str)
-                if m_prog:
-                    DOWNLOAD_STATE["msg"] = f"Downloading: {m_prog.group(1)}" + (f" • {m_spd.group(1)}/s" if m_spd else "")
-                elif line_str:
-                    DOWNLOAD_STATE["msg"] = line_str[:100]
-            proc.wait()
-            if proc.returncode != 0:
-                raise RuntimeError(f"aria2c exited with code {proc.returncode}")
+            DOWNLOAD_STATE["msg"] = f"Downloading {fname}..."
+            download_file_robust(final_url, dest_dir, fname, headers)
 
         else:
             if "huggingface.co" in domain and "/blob/" in url:
@@ -901,27 +940,8 @@ def run_download_task(raw_entry, target_type, civitai_key):
             fname = custom_name or urllib.parse.unquote(url.split("?")[0].rstrip("/").split("/")[-1])
             fname = ensure_valid_ext(fname)
             DOWNLOAD_STATE["filename"] = fname
-            DOWNLOAD_STATE["msg"] = f"Downloading {fname} via aria2c..."
-            cmd = [
-                "aria2c", "-x", "16", "-s", "16", "-k", "1M", "-c", "--file-allocation=none",
-                "--console-log-level=warn", "--summary-interval=1",
-                "-d", dest_dir, "-o", fname, url
-            ]
-            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True)
-            for line in proc.stdout:
-                line_str = line.strip()
-                m_pct = re.search(r'\((\d+)%\)', line_str)
-                if m_pct:
-                    DOWNLOAD_STATE["percent"] = int(m_pct.group(1))
-                m_prog = re.search(r'(\d+(?:\.\d+)?[A-Za-z]+/\d+(?:\.\d+)?[A-Za-z]+\(\d+%\))', line_str)
-                m_spd = re.search(r'DL:([^\s]+)', line_str)
-                if m_prog:
-                    DOWNLOAD_STATE["msg"] = f"Downloading: {m_prog.group(1)}" + (f" • {m_spd.group(1)}/s" if m_spd else "")
-                elif line_str:
-                    DOWNLOAD_STATE["msg"] = line_str[:100]
-            proc.wait()
-            if proc.returncode != 0:
-                raise RuntimeError(f"aria2c exited with code {proc.returncode}")
+            DOWNLOAD_STATE["msg"] = f"Downloading {fname}..."
+            download_file_robust(url, dest_dir, fname)
 
         DOWNLOAD_STATE["percent"] = 100
         DOWNLOAD_STATE["status"] = "done"
