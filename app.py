@@ -54,6 +54,9 @@ def embed_png_metadata(img_path, meta_info, final_caption):
         l2 = p.get("lora2")
         if l2 and l2 != "None":
             param_parts.append(f"LoRA 2: {l2} ({p.get('lora2_strength', 1.0)})")
+        l3 = p.get("lora3")
+        if l3 and l3 != "None":
+            param_parts.append(f"LoRA 3: {l3} ({p.get('lora3_strength', 1.0)})")
         if p.get("upsampler"):
             param_parts.append("Prompt Upsampler: True")
             if raw_prompt and raw_prompt != prompt_text:
@@ -142,6 +145,8 @@ DEFAULTS = {
     "lora1_strength": 1.0,
     "lora2": "None",
     "lora2_strength": 1.0,
+    "lora3": "None",
+    "lora3_strength": 1.0,
 }
 
 app = Flask(__name__)
@@ -293,7 +298,7 @@ def build_workflow(p):
     l1_name = p.get("lora1", "None")
     l1_str = float(p.get("lora1_strength", 1.0))
     # Turbo LoRA Protection: 8-step DMD LoRA requires CFG <= 1.5 and SLG off to avoid NaN latent explosion
-    if "8-step" in (str(l1_name) + str(p.get("lora2", ""))).lower():
+    if "8-step" in (str(l1_name) + str(p.get("lora2", "")) + str(p.get("lora3", ""))).lower():
         if ks["cfg"] > 1.5:
             ks["cfg"] = 1.0
         wf["18:24"]["inputs"]["switch"] = False
@@ -316,6 +321,17 @@ def build_workflow(p):
         }
         curr_model = ["lora_2", 0]
         curr_clip = ["lora_2", 1]
+
+    l3_name = p.get("lora3", "None")
+    l3_str = float(p.get("lora3_strength", 1.0))
+    if l3_name and l3_name != "None" and l3_str != 0:
+        wf["lora_3"] = {
+            "inputs": {"lora_name": l3_name, "strength_model": l3_str, "strength_clip": l3_str, "model": curr_model, "clip": curr_clip},
+            "class_type": "LoraLoader",
+            "_meta": {"title": f"LoRA 3 ({l3_name})"}
+        }
+        curr_model = ["lora_3", 0]
+        curr_clip = ["lora_3", 1]
 
     if curr_model != ["18:1", 0]:
         wf["18:15"]["inputs"]["model"] = curr_model
@@ -1118,6 +1134,10 @@ h3{font-size:13px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px;
               <div><label for="lora2">LoRA 2</label><select id="lora2"></select></div>
               <div><label for="lora2_str">Strength</label><input type="number" id="lora2_str" min="-2" max="2" step="0.05" value="1.0"></div>
             </div>
+            <div class="row" style="margin-top:6px">
+              <div><label for="lora3">LoRA 3</label><select id="lora3"></select></div>
+              <div><label for="lora3_str">Strength</label><input type="number" id="lora3_str" min="-2" max="2" step="0.05" value="1.0"></div>
+            </div>
           </div>
           <label for="mp" style="margin-top:8px">Megapixels: <b id="mpv"></b></label><input type="range" id="mp" min="0.25" max="4" step="0.05">
           <div class="row">
@@ -1199,6 +1219,7 @@ function setSettings(s){
   $("#aspect").value = s.aspect_ratio; $("#ckpt").value = s.checkpoint;
   $("#lora1").value = s.lora1 || "None"; $("#lora1_str").value = s.lora1_strength ?? 1.0;
   $("#lora2").value = s.lora2 || "None"; $("#lora2_str").value = s.lora2_strength ?? 1.0;
+  $("#lora3").value = s.lora3 || "None"; $("#lora3_str").value = s.lora3_strength ?? 1.0;
   $("#mp").value = s.megapixels; $("#mpv").textContent = (+s.megapixels).toFixed(2);
   $("#steps").value = s.steps; $("#cfg").value = s.cfg;
   $("#sampler").value = s.sampler; $("#scheduler").value = s.scheduler;
@@ -1210,6 +1231,7 @@ function getSettings(){
     aspect_ratio: $("#aspect").value, checkpoint: $("#ckpt").value,
     lora1: $("#lora1").value, lora1_strength: parseFloat($("#lora1_str").value) || 0,
     lora2: $("#lora2").value, lora2_strength: parseFloat($("#lora2_str").value) || 0,
+    lora3: $("#lora3").value, lora3_strength: parseFloat($("#lora3_str").value) || 0,
     megapixels: parseFloat($("#mp").value), steps: parseInt($("#steps").value, 10),
     cfg: parseFloat($("#cfg").value), sampler: $("#sampler").value, scheduler: $("#scheduler").value,
     seed: $("#rand").checked ? -1 : parseInt($("#seed").value || "0", 10),
@@ -1430,15 +1452,18 @@ async function init(){
   const o = await (await fetch("/api/options")).json();
   const d = o.defaults;
   fill("#aspect", o.aspect_ratios, d.aspect_ratio); fill("#ckpt", o.checkpoints, d.checkpoint);
-  fill("#lora1", o.loras, d.lora1); fill("#lora2", o.loras, d.lora2);
-  $("#lora1").addEventListener("change", e => {
+  fill("#lora1", o.loras, d.lora1); fill("#lora2", o.loras, d.lora2); fill("#lora3", o.loras, d.lora3);
+  const checkTurbo = e => {
     if (e.target.value && e.target.value.toLowerCase().includes("8-step")) {
       $("#steps").value = 8;
       $("#cfg").value = 1.0;
       $("#slg").checked = false;
       say("⚡ Turbo LoRA active: Steps set to 8, CFG to 1.0, SLG turned off.");
     }
-  });
+  };
+  $("#lora1").addEventListener("change", checkTurbo);
+  $("#lora2").addEventListener("change", checkTurbo);
+  $("#lora3").addEventListener("change", checkTurbo);
   fill("#sampler", o.samplers, d.sampler); fill("#scheduler", o.schedulers, d.scheduler);
   setSettings(d);
   renderHistory(); health(); setInterval(health, 15000);
@@ -1529,8 +1554,10 @@ $("#mp").addEventListener("input", e => $("#mpv").textContent = (+e.target.value
             if (opts.loras) {
               const curL1 = $("#lora1").value;
               const curL2 = $("#lora2").value;
+              const curL3 = $("#lora3").value;
               fill("#lora1", opts.loras, st.target_type === "lora" ? st.filename : curL1);
               fill("#lora2", opts.loras, curL2);
+              fill("#lora3", opts.loras, curL3);
             }
             say(`🎉 New ${st.target_type || "model"} loaded and ready to use!`);
           });
