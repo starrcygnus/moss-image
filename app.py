@@ -418,8 +418,7 @@ def build_workflow(p):
                 "vae": ["18:3", 0],
                 "edit_format": "ai-toolkit",
                 "image_strength": 1.0,
-                "images.image_0": ctrl_img_link,
-                "image_0": ctrl_img_link
+                "images.image_0": ctrl_img_link
             },
             "class_type": "TextEncodeMOSSImageEdit",
             "_meta": {"title": "Text Encode MOSS-Image Edit (positive)"}
@@ -431,8 +430,7 @@ def build_workflow(p):
                 "vae": ["18:3", 0],
                 "edit_format": "ai-toolkit",
                 "image_strength": 1.0,
-                "images.image_0": ctrl_img_link,
-                "image_0": ctrl_img_link
+                "images.image_0": ctrl_img_link
             },
             "class_type": "TextEncodeMOSSImageEdit",
             "_meta": {"title": "Text Encode MOSS-Image Edit (negative)"}
