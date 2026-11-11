@@ -233,6 +233,19 @@ def build_workflow(p):
     input_img = (p.get("input_image") or "").strip()
 
     if active_tab == "img2img" and input_img:
+        # Guarantee input image exists in ComfyUI/input folder
+        in_dir = os.path.join(COMFY_DIR, "input")
+        os.makedirs(in_dir, exist_ok=True)
+        in_path = os.path.join(in_dir, input_img)
+        if not os.path.isfile(in_path):
+            out_dir = os.path.join(COMFY_DIR, "output")
+            if os.path.isdir(out_dir):
+                for root, _, files in os.walk(out_dir):
+                    if input_img in files:
+                        import shutil
+                        shutil.copy2(os.path.join(root, input_img), in_path)
+                        break
+
         denoise_val = clamp(p.get("denoise", 0.65), 0.05, 1.0, float, 0.65)
         wf["input_load"] = {
             "inputs": {"image": input_img},
@@ -935,6 +948,30 @@ def view_image():
     mimes = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".webp": "image/webp"}
     return Response(open(full_path, "rb").read(), mimetype=mimes.get(ext, "image/png"))
 
+@app.post("/api/copy_to_input")
+def copy_to_input():
+    p = request.get_json(force=True, silent=True) or {}
+    fn = p.get("filename", "").strip()
+    if not fn:
+        return jsonify(error="No filename provided"), 400
+
+    in_dir = os.path.join(COMFY_DIR, "input")
+    os.makedirs(in_dir, exist_ok=True)
+    dest_path = os.path.join(in_dir, fn)
+
+    if os.path.isfile(dest_path):
+        return jsonify(filename=fn)
+
+    out_dir = os.path.join(COMFY_DIR, "output")
+    if os.path.isdir(out_dir):
+        for root, _, files in os.walk(out_dir):
+            if fn in files:
+                import shutil
+                shutil.copy2(os.path.join(root, fn), dest_path)
+                return jsonify(filename=fn)
+
+    return jsonify(filename=fn)
+
 @app.post("/api/upload")
 def upload_file():
     if "file" not in request.files:
@@ -1109,8 +1146,8 @@ INDEX_HTML = r'''<!doctype html>
       overflow: hidden;
     }
     .controls-pane {
-      width: 42%;
-      max-width: 580px;
+      width: 44%;
+      max-width: 620px;
       min-width: 380px;
       background: var(--bg-panel);
       border-right: 1px solid var(--border);
@@ -1147,7 +1184,7 @@ INDEX_HTML = r'''<!doctype html>
     .controls-scroll {
       flex: 1;
       overflow-y: auto;
-      padding: 12px 14px;
+      padding: 14px 16px 32px 16px;
       display: flex;
       flex-direction: column;
       gap: 12px;
@@ -1459,6 +1496,11 @@ INDEX_HTML = r'''<!doctype html>
           <div id="tag-autocomplete" class="tag-autocomplete-menu"></div>
         </div>
 
+        <!-- Top Generate Action Button -->
+        <button class="btn-main btn-generate-action" onclick="startGenerate()" style="margin:2px 0 4px 0; font-size:13.5px; padding:11px; font-weight:700;">
+          <span>✨ Generate Image</span>
+        </button>
+
         <div class="accordion">
           <div class="accordion-header" onclick="toggleAcc(this)">
             <span>Negative Prompt</span>
@@ -1635,7 +1677,7 @@ INDEX_HTML = r'''<!doctype html>
             <span>🎛️ LoRA Rack (6 Slots Active)</span>
             <span id="lora-active-badge" style="font-size:10px; color:var(--accent);">0 active</span>
           </div>
-          <div class="accordion-body" id="lora-rack-body" style="display:flex; flex-direction:column; gap:8px; max-height:280px; overflow-y:auto; padding:8px;">
+          <div class="accordion-body" id="lora-rack-body" style="display:flex; flex-direction:column; gap:8px; padding:8px;">
             <div class="lora-slot" id="slot-card-1">
               <div class="lora-header">
                 <label><input type="checkbox" id="lora-1-on" checked onchange="updateLoraBadge()"> Slot 1</label>
@@ -1753,7 +1795,7 @@ INDEX_HTML = r'''<!doctype html>
           </div>
         </div>
 
-        <button class="btn-main" id="btn-generate" onclick="startGenerate()">
+        <button class="btn-main btn-generate-action" id="btn-generate" onclick="startGenerate()" style="margin-top:6px; font-size:13.5px; padding:11px; font-weight:700;">
           <span>✨ Generate Image</span>
         </button>
       </div>
@@ -2067,7 +2109,7 @@ INDEX_HTML = r'''<!doctype html>
         payload[`lora${i}_enabled`] = $(`#lora-${i}-on`) ? $(`#lora-${i}-on`).checked : false;
       }
 
-      $('#btn-generate').disabled = true;
+      $$('.btn-generate-action').forEach(b => { b.disabled = true; b.innerHTML = '<span class="spinner"></span> <span>Generating...</span>'; });
       $('#gen-status').innerHTML = '<span class="spinner"></span> <span>Generating...</span>';
 
       try {
@@ -2084,7 +2126,7 @@ INDEX_HTML = r'''<!doctype html>
         pollStatus(data.prompt_id);
       } catch (e) {
         alert("Generation failed: " + e.message);
-        $('#btn-generate').disabled = false;
+        $$('.btn-generate-action').forEach(b => { b.disabled = false; b.innerHTML = '<span>✨ Generate Image</span>'; });
         $('#gen-status').innerHTML = '<span>Ready</span>';
       }
     }
@@ -2094,7 +2136,7 @@ INDEX_HTML = r'''<!doctype html>
         const res = await fetch(`/api/status/${pid}`);
         const data = await res.json();
         if (data.state === 'done') {
-          $('#btn-generate').disabled = false;
+          $$('.btn-generate-action').forEach(b => { b.disabled = false; b.innerHTML = '<span>✨ Generate Image</span>'; });
           $('#gen-status').innerHTML = '<span>✓ Done</span>';
           const img = data.images[0];
           gState.currentFilename = img.filename;
@@ -2107,7 +2149,7 @@ INDEX_HTML = r'''<!doctype html>
         }
       } catch (e) {
         alert("Status error: " + e.message);
-        $('#btn-generate').disabled = false;
+        $$('.btn-generate-action').forEach(b => { b.disabled = false; b.innerHTML = '<span>✨ Generate Image</span>'; });
         $('#gen-status').innerHTML = '<span>Error</span>';
       }
     }
@@ -2154,12 +2196,22 @@ INDEX_HTML = r'''<!doctype html>
       }
     }
 
-    function sendToImg2Img() {
+    async function sendToImg2Img() {
       if (!gState.currentFilename) return;
-      gState.inputImage = gState.currentFilename;
+      try {
+        const res = await fetch('/api/copy_to_input', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ filename: gState.currentFilename })
+        });
+        const data = await res.json();
+        gState.inputImage = data.filename || gState.currentFilename;
+      } catch (e) {
+        gState.inputImage = gState.currentFilename;
+      }
       switchTab('img2img');
       $('#i2i-placeholder').style.display = 'none';
-      $('#i2i-preview').src = `/api/view?filename=${gState.currentFilename}`;
+      $('#i2i-preview').src = `/api/view?filename=${gState.inputImage}&type=input`;
       $('#i2i-preview').style.display = 'block';
     }
 
