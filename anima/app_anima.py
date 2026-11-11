@@ -1980,7 +1980,15 @@ INDEX_HTML = r'''<!doctype html>
           </div>
         </div>
 
-                <!-- Bottom Action Row (Generate + Cancel) -->
+        <!-- Chime Alert Toggle -->
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-top:10px; margin-bottom:4px; padding:0 2px;">
+          <label style="display:flex; align-items:center; gap:6px; font-size:12px; cursor:pointer; user-select:none; color:var(--text-muted);">
+            <input type="checkbox" id="notif" checked style="accent-color:var(--accent); cursor:pointer;">
+            <span>🔔 Chime alert <a href="#" id="test-sound" style="color:var(--accent); text-decoration:underline; margin-left:4px;">(test)</a></span>
+          </label>
+        </div>
+
+        <!-- Bottom Action Row (Generate + Cancel) -->
         <div class="row" style="margin-top:8px; gap:8px;">
           <button class="btn-main btn-generate-action" id="btn-generate" onclick="startGenerate()" style="flex:1; font-size:13.5px; padding:11px; font-weight:700;">
             <span>✨ Generate Image</span>
@@ -2381,6 +2389,13 @@ INDEX_HTML = r'''<!doctype html>
           gState.currentSeed = data.seed;
           showImage(img.filename, data.seed);
           showToast("Image generation complete!", "success");
+
+          const notifEl = $('#notif');
+          if (!notifEl || notifEl.checked) {
+            playFinishSound();
+            sendFinishNotification($('#prompt').value, data.seed);
+            flashDocTitle("✨ Done! | ANIMA");
+          }
         } else if (data.state === 'error') {
           throw new Error(data.error || 'Generation failed');
         } else {
@@ -2466,35 +2481,82 @@ INDEX_HTML = r'''<!doctype html>
       showToast("GPU VRAM cleared.", "info");
     }
 
-    function playSuccessChime() {
+    let audioCtx = null;
+    function getAudioContext() {
       try {
-        const ctx = new (window.AudioContext || window.webkitAudioContext)();
-        const now = ctx.currentTime;
-        const osc1 = ctx.createOscillator();
-        const osc2 = ctx.createOscillator();
-        const gain = ctx.createGain();
-
-        osc1.type = 'sine';
-        osc1.frequency.setValueAtTime(587.33, now); // D5
-        osc1.frequency.setValueAtTime(880, now + 0.12); // A5
-
-        osc2.type = 'triangle';
-        osc2.frequency.setValueAtTime(880, now + 0.12);
-        osc2.frequency.setValueAtTime(1174.66, now + 0.24); // D6
-
-        gain.gain.setValueAtTime(0.12, now);
-        gain.gain.exponentialRampToValueAtTime(0.001, now + 0.6);
-
-        osc1.connect(gain);
-        osc2.connect(gain);
-        gain.connect(ctx.destination);
-
-        osc1.start(now);
-        osc2.start(now + 0.12);
-        osc1.stop(now + 0.6);
-        osc2.stop(now + 0.6);
-      } catch (e) {}
+        if (!audioCtx) {
+          const AC = window.AudioContext || window.webkitAudioContext;
+          if (AC) audioCtx = new AC();
+        }
+        if (audioCtx && audioCtx.state === "suspended") {
+          audioCtx.resume();
+        }
+        return audioCtx;
+      } catch(e) { return null; }
     }
+
+    function playFinishSound() {
+      try {
+        const ctx = getAudioContext();
+        if (!ctx) return;
+        const now = ctx.currentTime;
+        const playTone = (freq, start, duration, vol) => {
+          const osc = ctx.createOscillator();
+          const gain = ctx.createGain();
+          osc.type = "sine";
+          osc.frequency.setValueAtTime(freq, start);
+          gain.gain.setValueAtTime(vol, start);
+          gain.gain.exponentialRampToValueAtTime(0.0001, start + duration);
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.start(start);
+          osc.stop(start + duration);
+        };
+        // Harmonic 3-tone chime: D5 (587Hz) -> A5 (880Hz) -> D6 (1175Hz)
+        playTone(587.33, now, 0.35, 0.25);
+        playTone(880.00, now + 0.12, 0.55, 0.30);
+        playTone(1174.66, now + 0.24, 0.70, 0.20);
+      } catch(e) { console.warn("Audio error:", e); }
+    }
+
+    function playSuccessChime() {
+      playFinishSound();
+    }
+
+    function sendFinishNotification(caption, seed) {
+      if ("Notification" in window) {
+        if (Notification.permission === "granted") {
+          try {
+            new Notification("ANIMA WebUI: Generation Done! 🎨", {
+              body: (caption || "Your image is ready!").slice(0, 100) + (seed ? " (Seed: " + seed + ")" : ""),
+              icon: "/favicon.ico"
+            });
+          } catch(e){}
+        }
+      }
+    }
+
+    let origDocTitle = document.title || "ANIMA WebUI";
+    let titleFlashTimer = null;
+    function flashDocTitle(msg) {
+      if (titleFlashTimer) clearInterval(titleFlashTimer);
+      let flag = false, count = 0;
+      titleFlashTimer = setInterval(() => {
+        document.title = (flag = !flag) ? msg : origDocTitle;
+        if (++count > 20) {
+          clearInterval(titleFlashTimer);
+          titleFlashTimer = null;
+          document.title = origDocTitle;
+        }
+      }, 1000);
+    }
+    window.addEventListener("focus", () => {
+      if (titleFlashTimer) {
+        clearInterval(titleFlashTimer);
+        titleFlashTimer = null;
+        document.title = origDocTitle;
+      }
+    });
 
     // Downloader
     let dlPollTimer = null;
@@ -2903,7 +2965,38 @@ INDEX_HTML = r'''<!doctype html>
       });
     }
 
-    window.onload = () => { loadModels(); initDragAndDrop(); };
+    window.onload = () => { loadModels(); initDragAndDrop();
+    // Chime Notification setup
+    const notifBox = $('#notif');
+    if (notifBox) {
+      const saved = localStorage.getItem("anima_notif");
+      if (saved !== null) notifBox.checked = (saved === "1");
+      notifBox.addEventListener("change", () => {
+        localStorage.setItem("anima_notif", notifBox.checked ? "1" : "0");
+        if (notifBox.checked) getAudioContext();
+      });
+    }
+
+    const testSndBtn = $('#test-sound');
+    if (testSndBtn) {
+      testSndBtn.addEventListener("click", e => {
+        e.preventDefault();
+        e.stopPropagation();
+        getAudioContext();
+        playFinishSound();
+        if ("Notification" in window) {
+          if (Notification.permission === "default") {
+            Notification.requestPermission().then(p => {
+              if (p === "granted") new Notification("ANIMA WebUI 🎨", { body: "Sound & desktop notifications active!" });
+            });
+          } else if (Notification.permission === "granted") {
+            new Notification("ANIMA WebUI 🎨", { body: "Sound & desktop notifications active!" });
+          }
+        }
+        showToast("🔔 Chime alert played!", "info");
+      });
+    }
+ };
   </script>
   <div id="toast-container" class="toast-container"></div>
 </body>
