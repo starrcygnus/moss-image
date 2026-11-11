@@ -420,20 +420,41 @@ def load_booru_tags():
         return _booru_tags
 
     tags = []
-    tags_file = os.path.join(WD_DIR, "selected_tags.csv")
-    if os.path.exists(tags_file):
+    danbooru_file = os.path.join(WD_DIR, "danbooru.csv")
+    selected_file = os.path.join(WD_DIR, "selected_tags.csv")
+
+    if os.path.exists(danbooru_file):
         try:
-            with open(tags_file, "r", encoding="utf-8") as f:
+            with open(danbooru_file, "r", encoding="utf-8", errors="ignore") as f:
+                reader = csv.reader(f)
+                for row in reader:
+                    if len(row) >= 3:
+                        try:
+                            t_name = row[0].replace("_", " ")
+                            t_cat = int(row[1])
+                            t_count = int(row[2])
+                            tags.append((t_name, t_cat, t_count))
+                        except ValueError:
+                            pass
+        except Exception as e:
+            print(f"Error reading danbooru.csv: {e}")
+
+    if not tags and os.path.exists(selected_file):
+        try:
+            with open(selected_file, "r", encoding="utf-8") as f:
                 reader = csv.reader(f)
                 header = next(reader, None)
                 for row in reader:
                     if len(row) >= 4:
-                        t_name = row[1].replace("_", " ")
-                        t_cat = int(row[2])
-                        t_count = int(row[3]) if row[3].isdigit() else 0
-                        tags.append((t_name, t_cat, t_count))
+                        try:
+                            t_name = row[1].replace("_", " ")
+                            t_cat = int(row[2])
+                            t_count = int(row[3]) if row[3].isdigit() else 0
+                            tags.append((t_name, t_cat, t_count))
+                        except ValueError:
+                            pass
         except Exception as e:
-            print(f"Error reading tags CSV: {e}")
+            print(f"Error reading selected_tags.csv: {e}")
 
     if not tags:
         # High-frequency Danbooru starter tags for immediate autocomplete fallback
@@ -774,6 +795,57 @@ def run_download_task(raw_entry, target_type, civitai_key, custom_name_override=
 
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
+PROGRESS_STATE = {"value": 0, "max": 0, "percent": 0, "node": ""}
+
+def init_comfy_ws_listener():
+    def listener():
+        global PROGRESS_STATE
+        try:
+            import websocket
+        except ImportError:
+            try:
+                subprocess.run([sys.executable, "-m", "pip", "install", "-q", "websocket-client"], check=False)
+                import websocket
+            except Exception:
+                return
+
+        ws_host = COMFY.replace("http://", "").replace("https://", "").rstrip("/")
+        ws_url = f"ws://{ws_host}/ws?clientId={CLIENT_ID}"
+
+        while True:
+            try:
+                ws = websocket.create_connection(ws_url, timeout=10)
+                while True:
+                    msg = ws.recv()
+                    if not msg:
+                        break
+                    if isinstance(msg, str):
+                        try:
+                            data = json.loads(msg)
+                            m_type = data.get("type")
+                            if m_type == "progress":
+                                p_data = data.get("data", {})
+                                val = p_data.get("value", 0)
+                                m = p_data.get("max", 0)
+                                pct = int(val / m * 100) if m > 0 else 0
+                                PROGRESS_STATE["value"] = val
+                                PROGRESS_STATE["max"] = m
+                                PROGRESS_STATE["percent"] = pct
+                            elif m_type == "executing":
+                                node = data.get("data", {}).get("node")
+                                PROGRESS_STATE["node"] = node or ""
+                                if not node:
+                                    PROGRESS_STATE["percent"] = 100
+                        except Exception:
+                            pass
+            except Exception:
+                time.sleep(2)
+
+    t = threading.Thread(target=listener, daemon=True)
+    t.start()
+
+init_comfy_ws_listener()
+
 app = Flask(__name__)
 
 def comfy_get(path):
@@ -889,6 +961,16 @@ def generate():
     JOB_PARAMS[prompt_id] = {"params": p, "seed": seed, "workflow": wf}
     return jsonify(prompt_id=prompt_id, seed=seed)
 
+@app.post("/api/cancel")
+def cancel_generation():
+    global PROGRESS_STATE
+    try:
+        requests.post(f"{COMFY}/interrupt", timeout=5)
+        PROGRESS_STATE = {"value": 0, "max": 0, "percent": 0, "node": ""}
+        return jsonify(status="interrupted")
+    except Exception as e:
+        return jsonify(error=str(e)), 500
+
 @app.get("/api/status/<pid>")
 def check_status(pid):
     try:
@@ -928,12 +1010,12 @@ def check_status(pid):
         running = [item[1] for item in q.get("queue_running", [])]
         pending = [item[1] for item in q.get("queue_pending", [])]
         if pid in running:
-            return jsonify(state="running")
+            return jsonify(state="running", progress=PROGRESS_STATE)
         if pid in pending:
-            return jsonify(state="queued", position=pending.index(pid) + 1)
+            return jsonify(state="queued", position=pending.index(pid) + 1, progress=PROGRESS_STATE)
     except Exception:
         pass
-    return jsonify(state="queued")
+    return jsonify(state="queued", progress=PROGRESS_STATE)
 
 @app.get("/api/view")
 def view_image():
@@ -1532,10 +1614,26 @@ INDEX_HTML = r'''<!doctype html>
           <div id="tag-autocomplete" class="tag-autocomplete-menu"></div>
         </div>
 
-        <!-- Top Generate Action Button -->
-        <button class="btn-main btn-generate-action" onclick="startGenerate()" style="margin:2px 0 4px 0; font-size:13.5px; padding:11px; font-weight:700;">
-          <span>✨ Generate Image</span>
-        </button>
+        <!-- Top Action Row (Generate + Cancel) -->
+        <div class="row" style="margin:2px 0 4px 0; gap:8px;">
+          <button class="btn-main btn-generate-action" onclick="startGenerate()" style="flex:1; font-size:13.5px; padding:11px; font-weight:700;">
+            <span>✨ Generate Image</span>
+          </button>
+          <button class="btn-cancel-action" onclick="cancelGenerate()" style="display:none; padding:11px 16px; background:#dc2626; color:#fff; border:none; border-radius:var(--radius); font-size:12.5px; font-weight:700; cursor:pointer;" title="Cancel running generation">
+            <span>🛑 Cancel</span>
+          </button>
+        </div>
+
+        <!-- Real-time Progress Bar -->
+        <div id="gen-progress-wrap" style="display:none; margin:2px 0 6px 0; background:var(--bg-card); border:1px solid var(--border); border-radius:var(--radius); padding:8px 10px;">
+          <div style="display:flex; justify-content:space-between; font-size:11px; font-weight:600; margin-bottom:4px;">
+            <span id="gen-progress-step" style="color:var(--text);">Sampling...</span>
+            <span id="gen-progress-pct" style="color:var(--accent); font-weight:700;">0%</span>
+          </div>
+          <div style="width:100%; height:7px; background:rgba(255,255,255,0.06); border-radius:4px; overflow:hidden;">
+            <div id="gen-progress-fill" style="width:0%; height:100%; background:linear-gradient(90deg, var(--accent), var(--accent-2)); transition:width 0.25s ease; border-radius:4px;"></div>
+          </div>
+        </div>
 
         <div class="accordion">
           <div class="accordion-header" onclick="toggleAcc(this)">
@@ -1831,9 +1929,15 @@ INDEX_HTML = r'''<!doctype html>
           </div>
         </div>
 
-        <button class="btn-main btn-generate-action" id="btn-generate" onclick="startGenerate()" style="margin-top:6px; font-size:13.5px; padding:11px; font-weight:700;">
-          <span>✨ Generate Image</span>
-        </button>
+                <!-- Bottom Action Row (Generate + Cancel) -->
+        <div class="row" style="margin-top:8px; gap:8px;">
+          <button class="btn-main btn-generate-action" id="btn-generate" onclick="startGenerate()" style="flex:1; font-size:13.5px; padding:11px; font-weight:700;">
+            <span>✨ Generate Image</span>
+          </button>
+          <button class="btn-cancel-action" onclick="cancelGenerate()" style="display:none; padding:11px 16px; background:#dc2626; color:#fff; border:none; border-radius:var(--radius); font-size:12.5px; font-weight:700; cursor:pointer;" title="Cancel running generation">
+            <span>🛑 Cancel</span>
+          </button>
+        </div>
       </div>
     </div>
 
@@ -2118,7 +2222,54 @@ INDEX_HTML = r'''<!doctype html>
       p.value = append && p.value ? `${p.value}, ${window._lastExtractedCaption}` : window._lastExtractedCaption;
     }
 
-    // Generate Pipeline
+    // Generate Pipeline with Real-time Progress & Cancellation
+    let pollTimer = null;
+    let isGenerating = false;
+
+    function setGeneratingState(generating, stepText, pct) {
+      isGenerating = generating;
+      $$('.btn-generate-action').forEach(b => {
+        b.disabled = generating;
+        if (generating) {
+          const statusText = pct !== undefined ? `Generating (${pct}%)...` : 'Generating...';
+          b.innerHTML = `<span class="spinner"></span> <span>${statusText}</span>`;
+        } else {
+          b.innerHTML = '<span>✨ Generate Image</span>';
+        }
+      });
+
+      $$('.btn-cancel-action').forEach(b => {
+        b.style.display = generating ? 'block' : 'none';
+      });
+
+      const progWrap = $('#gen-progress-wrap');
+      if (progWrap) {
+        progWrap.style.display = generating ? 'block' : 'none';
+        if (pct !== undefined) {
+          $('#gen-progress-fill').style.width = pct + '%';
+          $('#gen-progress-pct').innerText = pct + '%';
+        }
+        if (stepText) {
+          $('#gen-progress-step').innerText = stepText;
+        }
+      }
+
+      $('#gen-status').innerHTML = generating ? '<span class="spinner"></span> <span>Generating...</span>' : '<span>Ready</span>';
+    }
+
+    async function cancelGenerate() {
+      clearTimeout(pollTimer);
+      showToast("Canceling generation...", "info", 1500);
+      try {
+        await fetch('/api/cancel', { method: 'POST' });
+        showToast("Generation canceled.", "info");
+      } catch (e) {
+        console.error("Cancel error", e);
+      }
+      setGeneratingState(false);
+      $('#gen-status').innerHTML = '<span>Canceled</span>';
+    }
+
     async function startGenerate() {
       const prompt = $('#prompt').value.trim();
       if (!prompt) return showToast("Please enter a prompt.", "error");
@@ -2145,8 +2296,7 @@ INDEX_HTML = r'''<!doctype html>
         payload[`lora${i}_enabled`] = $(`#lora-${i}-on`) ? $(`#lora-${i}-on`).checked : false;
       }
 
-      $$('.btn-generate-action').forEach(b => { b.disabled = true; b.innerHTML = '<span class="spinner"></span> <span>Generating...</span>'; });
-      $('#gen-status').innerHTML = '<span class="spinner"></span> <span>Generating...</span>';
+      setGeneratingState(true, 'Initializing...', 0);
 
       try {
         const res = await fetch('/api/generate', {
@@ -2162,31 +2312,39 @@ INDEX_HTML = r'''<!doctype html>
         pollStatus(data.prompt_id);
       } catch (e) {
         showToast("Generation failed: " + e.message, "error", 6000);
-        $$('.btn-generate-action').forEach(b => { b.disabled = false; b.innerHTML = '<span>✨ Generate Image</span>'; });
-        $('#gen-status').innerHTML = '<span>Ready</span>';
+        setGeneratingState(false);
       }
     }
 
     async function pollStatus(pid) {
+      if (!isGenerating) return;
       try {
         const res = await fetch(`/api/status/${pid}`);
         const data = await res.json();
         if (data.state === 'done') {
-          $$('.btn-generate-action').forEach(b => { b.disabled = false; b.innerHTML = '<span>✨ Generate Image</span>'; });
+          setGeneratingState(false);
           $('#gen-status').innerHTML = '<span>✓ Done</span>';
           const img = data.images[0];
           gState.currentFilename = img.filename;
           gState.currentSeed = data.seed;
           showImage(img.filename, data.seed);
+          showToast("Image generation complete!", "success");
         } else if (data.state === 'error') {
           throw new Error(data.error || 'Generation failed');
         } else {
-          setTimeout(() => pollStatus(pid), 800);
+          if (data.progress && data.progress.max > 0) {
+            const val = data.progress.value;
+            const max = data.progress.max;
+            const pct = data.progress.percent;
+            setGeneratingState(true, `Step ${val}/${max}`, pct);
+          } else if (data.position) {
+            setGeneratingState(true, `Queue position: ${data.position}`, 0);
+          }
+          pollTimer = setTimeout(() => pollStatus(pid), 400);
         }
       } catch (e) {
         showToast("Status error: " + e.message, "error", 4500);
-        $$('.btn-generate-action').forEach(b => { b.disabled = false; b.innerHTML = '<span>✨ Generate Image</span>'; });
-        $('#gen-status').innerHTML = '<span>Error</span>';
+        setGeneratingState(false);
       }
     }
 
