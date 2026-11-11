@@ -1458,6 +1458,42 @@ INDEX_HTML = r'''<!doctype html>
     .tag-ac-badge.artist { background: rgba(168,85,247,0.25); color: #c084fc; border: 1px solid rgba(168,85,247,0.4); }
     .tag-ac-badge.copyright { background: rgba(6,182,212,0.25); color: #22d3ee; border: 1px solid rgba(6,182,212,0.4); }
     .tag-ac-count { font-size: 10px; color: var(--text-muted); margin-left: 6px; }
+    .toast-container {
+      position: fixed;
+      bottom: 24px;
+      right: 24px;
+      z-index: 999999;
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      pointer-events: none;
+    }
+    .toast {
+      background: #161b22;
+      color: #f0f6fc;
+      border: 1px solid var(--border);
+      border-left: 4px solid var(--accent);
+      padding: 10px 16px;
+      border-radius: var(--radius);
+      font-size: 12.5px;
+      font-weight: 500;
+      box-shadow: 0 10px 30px rgba(0,0,0,0.7);
+      opacity: 0;
+      transform: translateY(12px) scale(0.98);
+      transition: all 0.2s cubic-bezier(0.16, 1, 0.3, 1);
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      max-width: 420px;
+      pointer-events: auto;
+    }
+    .toast.show {
+      opacity: 1;
+      transform: translateY(0) scale(1);
+    }
+    .toast.success { border-left-color: var(--success); }
+    .toast.error { border-left-color: var(--danger); }
+    .toast.info { border-left-color: var(--accent); }
   </style>
 </head>
 <body>
@@ -1599,7 +1635,7 @@ INDEX_HTML = r'''<!doctype html>
 
         <!-- Tab 3: WD-EVA02 Auto-Tagger -->
         <div id="tab-tagger" class="tab-content" style="display:none;">
-          <div class="dropzone" onclick="$('#tagger-file').click()">
+          <div class="dropzone" id="tagger-dropzone" onclick="$('#tagger-file').click()">
             <input type="file" id="tagger-file" accept="image/*" style="display:none" onchange="handleTaggerUpload(this.files[0])">
             <div id="tagger-placeholder">🏷️ Drop anime image to extract Danbooru tags</div>
             <img id="tagger-preview" style="max-height:140px; display:none; margin:0 auto; border-radius:4px;">
@@ -2011,12 +2047,12 @@ INDEX_HTML = r'''<!doctype html>
     }
 
     async function tagCurrentImage() {
-      if (!gState.inputImage) return alert("Please upload a reference image first.");
+      if (!gState.inputImage) return showToast("Please upload a reference image first.", "error");
       runTagger(gState.inputImage, true);
     }
 
     async function runStandaloneTagger() {
-      if (!gState.taggerImage) return alert("Please upload an image to tag.");
+      if (!gState.taggerImage) return showToast("Please upload an image to tag.", "error");
       runTagger(gState.taggerImage, false);
     }
 
@@ -2041,7 +2077,7 @@ INDEX_HTML = r'''<!doctype html>
         if (autoInsert) {
           const p = $('#prompt');
           p.value = p.value ? `${p.value}, ${data.caption}` : data.caption;
-          alert("✨ Extracted Danbooru tags added to Prompt!");
+          showToast("Extracted Danbooru tags added to Prompt!", "success");
         } else {
           $('#tagger-results').style.display = 'block';
           const container = $('#tag-chips-container');
@@ -2052,7 +2088,7 @@ INDEX_HTML = r'''<!doctype html>
           container.innerHTML = chips;
         }
       } catch (e) {
-        alert("Tagging error: " + e.message);
+        showToast("Tagging error: " + e.message, "error", 4500);
       } finally {
         btn.disabled = false;
         btn.innerText = '⚡ Extract Tags with WD-EVA02';
@@ -2072,7 +2108,7 @@ INDEX_HTML = r'''<!doctype html>
     function copyExtractedTags() {
       if (window._lastExtractedCaption) {
         navigator.clipboard.writeText(window._lastExtractedCaption);
-        alert("Copied tags to clipboard!");
+        showToast("Copied tags to clipboard!", "success");
       }
     }
 
@@ -2085,7 +2121,7 @@ INDEX_HTML = r'''<!doctype html>
     // Generate Pipeline
     async function startGenerate() {
       const prompt = $('#prompt').value.trim();
-      if (!prompt) return alert("Please enter a prompt.");
+      if (!prompt) return showToast("Please enter a prompt.", "error");
 
       const payload = {
         prompt: prompt,
@@ -2125,7 +2161,7 @@ INDEX_HTML = r'''<!doctype html>
         gState.currentSeed = data.seed;
         pollStatus(data.prompt_id);
       } catch (e) {
-        alert("Generation failed: " + e.message);
+        showToast("Generation failed: " + e.message, "error", 6000);
         $$('.btn-generate-action').forEach(b => { b.disabled = false; b.innerHTML = '<span>✨ Generate Image</span>'; });
         $('#gen-status').innerHTML = '<span>Ready</span>';
       }
@@ -2148,7 +2184,7 @@ INDEX_HTML = r'''<!doctype html>
           setTimeout(() => pollStatus(pid), 800);
         }
       } catch (e) {
-        alert("Status error: " + e.message);
+        showToast("Status error: " + e.message, "error", 4500);
         $$('.btn-generate-action').forEach(b => { b.disabled = false; b.innerHTML = '<span>✨ Generate Image</span>'; });
         $('#gen-status').innerHTML = '<span>Error</span>';
       }
@@ -2192,7 +2228,7 @@ INDEX_HTML = r'''<!doctype html>
     function copySeed() {
       if (gState.currentSeed !== null) {
         navigator.clipboard.writeText(String(gState.currentSeed));
-        alert(`Seed ${gState.currentSeed} copied!`);
+        showToast(`Seed ${gState.currentSeed} copied!`, "success");
       }
     }
 
@@ -2217,7 +2253,7 @@ INDEX_HTML = r'''<!doctype html>
 
     async function clearCache() {
       await fetch('/api/clear_cache', { method: 'POST' });
-      alert("GPU VRAM cleared.");
+      showToast("GPU VRAM cleared.", "info");
     }
 
     function playSuccessChime() {
@@ -2254,7 +2290,7 @@ INDEX_HTML = r'''<!doctype html>
     let dlPollTimer = null;
     async function startDownload() {
       const url = $('#down-url').value.trim();
-      if (!url) return alert("Please enter a URL or Civitai AIR identifier.");
+      if (!url) return showToast("Please enter a URL or Civitai AIR identifier.", "error");
       const btn = $('#btn-start-down');
       const statusEl = $('#down-status');
       btn.disabled = true;
@@ -2277,7 +2313,7 @@ INDEX_HTML = r'''<!doctype html>
           btn.disabled = false;
           statusEl.style.color = "var(--danger)";
           statusEl.innerText = "✗ " + data.error;
-          alert(data.error);
+          showToast(data.error, "error", 4500);
         } else {
           pollDownload();
         }
@@ -2316,7 +2352,7 @@ INDEX_HTML = r'''<!doctype html>
             $('#lora-1-on').checked = true;
             updateLoraBadge();
           }
-          alert(st.msg);
+          showToast(st.msg, "error", 4500);
         } else if (st.status === 'error') {
           btn.disabled = false;
           statusEl.style.color = "var(--danger)";
@@ -2455,8 +2491,99 @@ INDEX_HTML = r'''<!doctype html>
       }
     });
 
-    window.onload = loadModels;
+
+    // ---------------------------------------------------------------------------
+    // Non-blocking Toast Notification System (replaces native alert popups)
+    // ---------------------------------------------------------------------------
+    function showToast(msg, type = 'info', duration = 3000) {
+      const container = $('#toast-container');
+      if (!container) return;
+      const toast = document.createElement('div');
+      toast.className = `toast ${type}`;
+      const icon = type === 'success' ? '✓' : (type === 'error' ? '✕' : 'ℹ');
+      toast.innerHTML = `<span style="font-weight:700;">${icon}</span> <span>${msg}</span>`;
+      container.appendChild(toast);
+      setTimeout(() => toast.classList.add('show'), 10);
+      setTimeout(() => {
+        toast.classList.remove('show');
+        setTimeout(() => toast.remove(), 250);
+      }, duration);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Drag-and-Drop & Clipboard Paste Controller
+    // ---------------------------------------------------------------------------
+    function initDragAndDrop() {
+      // 1. Prevent default browser drag/drop navigation everywhere (stops new tab open)
+      ['dragenter', 'dragover', 'dragleave', 'drop'].forEach(name => {
+        window.addEventListener(name, e => {
+          e.preventDefault();
+          e.stopPropagation();
+        }, false);
+        document.addEventListener(name, e => {
+          e.preventDefault();
+          e.stopPropagation();
+        }, false);
+      });
+
+      function bindDropzone(dzSelector, inpSelector, handler) {
+        const dz = $(dzSelector);
+        if (!dz) return;
+
+        ['dragenter', 'dragover'].forEach(name => {
+          dz.addEventListener(name, e => {
+            e.preventDefault();
+            e.stopPropagation();
+            dz.classList.add('dragover');
+          }, false);
+        });
+
+        ['dragleave', 'dragend'].forEach(name => {
+          dz.addEventListener(name, e => {
+            e.preventDefault();
+            e.stopPropagation();
+            dz.classList.remove('dragover');
+          }, false);
+        });
+
+        dz.addEventListener('drop', e => {
+          e.preventDefault();
+          e.stopPropagation();
+          dz.classList.remove('dragover');
+          const dt = e.dataTransfer;
+          if (dt && dt.files && dt.files.length > 0) {
+            handler(dt.files[0]);
+          }
+        }, false);
+      }
+
+      bindDropzone('#i2i-dropzone', '#i2i-file', handleFileSelect);
+      bindDropzone('#tagger-dropzone', '#tagger-file', handleTaggerUpload);
+
+      // 2. Support Ctrl+V paste from clipboard directly into active tab
+      window.addEventListener('paste', e => {
+        const items = (e.clipboardData || e.originalEvent?.clipboardData)?.items;
+        if (!items) return;
+        for (const item of items) {
+          if (item.kind === 'file' && item.type.startsWith('image/')) {
+            const file = item.getAsFile();
+            if (gState.activeTab === 'tagger') {
+              handleTaggerUpload(file);
+              showToast("Pasted image into Auto-Tagger!", "success");
+            } else {
+              switchTab('img2img');
+              handleFileSelect(file);
+              showToast("Pasted image into Img2Img!", "success");
+            }
+            break;
+          }
+        }
+      });
+    }
+
+    window.onload = () => { loadModels(); initDragAndDrop(); };
   </script>
+  <div id="toast-container" class="toast-container"></div>
 </body>
 </html>
 '''
