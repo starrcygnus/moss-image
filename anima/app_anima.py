@@ -246,15 +246,51 @@ def build_workflow(p):
                         shutil.copy2(os.path.join(root, input_img), in_path)
                         break
 
+        resize_mode = p.get("img2img_resize", "crop")
+
+        # Determine target dimensions & crop behavior
+        tw, th = w, h
+        crop_method = "center"
+
+        if resize_mode == "original" and os.path.isfile(in_path):
+            try:
+                from PIL import Image
+                with Image.open(in_path) as im:
+                    ow, oh = im.size
+                scale = min(1.0, 1024.0 / max(ow, oh))
+                tw = max(256, (int(ow * scale) // 16) * 16)
+                th = max(256, (int(oh * scale) // 16) * 16)
+                crop_method = "disabled"
+            except Exception:
+                tw, th = w, h
+                crop_method = "center"
+        elif resize_mode == "stretch":
+            tw, th = w, h
+            crop_method = "disabled"
+        else: # "crop" (default): follow selected aspect ratio with center crop
+            tw, th = w, h
+            crop_method = "center"
+
         denoise_val = clamp(p.get("denoise", 0.65), 0.05, 1.0, float, 0.65)
         wf["input_load"] = {
             "inputs": {"image": input_img},
             "class_type": "LoadImage",
             "_meta": {"title": "Load Input Image"}
         }
+        wf["input_scale"] = {
+            "inputs": {
+                "image": ["input_load", 0],
+                "upscale_method": "bicubic",
+                "width": tw,
+                "height": th,
+                "crop": crop_method
+            },
+            "class_type": "ImageScale",
+            "_meta": {"title": "Scale Input Image"}
+        }
         wf["input_encode"] = {
             "inputs": {
-                "pixels": ["input_load", 0],
+                "pixels": ["input_scale", 0],
                 "vae": ["3", 0]
             },
             "class_type": "VAEEncode",
@@ -330,9 +366,8 @@ def get_wd_tagger():
             _wd_tags_info = tags_list
 
             # ONNX Session
-            avail = ort.get_available_providers()
-            providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if "CUDAExecutionProvider" in avail else ["CPUExecutionProvider"]
-            print(f"Loading WD-EVA02 ONNX session on {providers}...")
+            providers = ["CPUExecutionProvider"]
+            print(f"Loading WD-EVA02 ONNX session on CPU to preserve 100% GPU VRAM for Anima...")
             _wd_session = ort.InferenceSession(model_file, providers=providers)
             print("✓ WD-EVA02 Tagger loaded successfully.")
     return _wd_session, _wd_tags_info
@@ -941,6 +976,12 @@ def generate():
         return jsonify(error=f"Workflow build error: {str(e)}"), 500
 
     try:
+        # Soft empty cache to prevent VRAM memory leaks between runs
+        try:
+            requests.post(f"{COMFY}/free", json={"unload_models": False, "free_memory": True}, timeout=2)
+        except Exception:
+            pass
+
         r = requests.post(
             f"{COMFY}/prompt",
             json={
@@ -1729,6 +1770,16 @@ INDEX_HTML = r'''<!doctype html>
               <input type="range" id="denoise" min="0.10" max="1.0" step="0.05" value="0.65" oninput="$('#val-denoise').innerText=this.value">
             </div>
           </div>
+          <div class="row" style="margin-top:8px;">
+            <div class="col">
+              <label for="img2img_resize">Resize & Aspect Ratio</label>
+              <select id="img2img_resize">
+                <option value="crop" selected>📐 Crop & Fit to Selected Aspect Ratio</option>
+                <option value="original">🖼️ Keep Source Aspect Ratio (Safe 1024px Max)</option>
+                <option value="stretch">↔️ Stretch to Selected Aspect Ratio</option>
+              </select>
+            </div>
+          </div>
         </div>
 
         <!-- Tab 3: WD-EVA02 Auto-Tagger -->
@@ -2286,7 +2337,8 @@ INDEX_HTML = r'''<!doctype html>
         seed: parseInt($('#seed').value),
         tab: gState.activeTab,
         input_image: gState.inputImage,
-        denoise: parseFloat($('#denoise').value)
+        denoise: parseFloat($('#denoise').value),
+        img2img_resize: $('#img2img_resize') ? $('#img2img_resize').value : 'crop'
       };
 
       for (let i = 1; i <= 6; i++) {
