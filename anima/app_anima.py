@@ -2375,6 +2375,92 @@ INDEX_HTML = r'''<!doctype html>
 
 
     // ---------------------------------------------------------------------------
+
+    // ---------------------------------------------------------------------------
+    // A1111-style Prompt Weight Adjustment (Ctrl+Shift+Up / Ctrl+Shift+Down)
+    // ---------------------------------------------------------------------------
+    function adjustPromptWeight(textarea, delta) {
+      if (!textarea) return;
+      let start = textarea.selectionStart;
+      let end = textarea.selectionEnd;
+      const val = textarea.value;
+
+      // 1. If no text selected, auto-expand to surrounding token or parenthesized group
+      if (start === end) {
+        let openParen = -1;
+        let closeParen = -1;
+        for (let i = start - 1; i >= 0; i--) {
+          if (val[i] === ')') break;
+          if (val[i] === '(') { openParen = i; break; }
+        }
+        if (openParen !== -1) {
+          for (let i = start; i < val.length; i++) {
+            if (val[i] === '(') break;
+            if (val[i] === ')') { closeParen = i + 1; break; }
+          }
+        }
+
+        if (openParen !== -1 && closeParen !== -1) {
+          start = openParen;
+          end = closeParen;
+        } else {
+          let tokenStart = start;
+          while (tokenStart > 0 && val[tokenStart - 1] !== ',' && val[tokenStart - 1] !== '\n') {
+            tokenStart--;
+          }
+          let tokenEnd = end;
+          while (tokenEnd < val.length && val[tokenEnd] !== ',' && val[tokenEnd] !== '\n') {
+            tokenEnd++;
+          }
+          const raw = val.slice(tokenStart, tokenEnd);
+          const leadingSpaces = (raw.match(/^\s*/) || [''])[0].length;
+          const trailingSpaces = (raw.match(/\s*$/) || [''])[0].length;
+          start = tokenStart + leadingSpaces;
+          end = tokenEnd - trailingSpaces;
+        }
+      }
+
+      if (start >= end) return;
+
+      const selectedText = val.slice(start, end).trim();
+      if (!selectedText) return;
+
+      let text = selectedText;
+      let currentWeight = 1.0;
+
+      // Match (tag:weight)
+      const matchWeight = selectedText.match(/^\((.+):(-?\d*(?:\.\d+)?)\)$/);
+      // Match (tag)
+      const matchParen = selectedText.match(/^\((.+)\)$/);
+
+      if (matchWeight) {
+        text = matchWeight[1].trim();
+        currentWeight = parseFloat(matchWeight[2]);
+        if (isNaN(currentWeight)) currentWeight = 1.0;
+      } else if (matchParen) {
+        text = matchParen[1].trim();
+        currentWeight = 1.1;
+      }
+
+      let newWeight = Math.round((currentWeight + delta) * 100) / 100;
+      let replacement = '';
+      if (Math.abs(newWeight - 1.0) < 0.001) {
+        replacement = text;
+      } else {
+        const weightStr = (Math.round(newWeight * 100) / 100).toString();
+        replacement = `(${text}:${weightStr})`;
+      }
+
+      const before = val.slice(0, start);
+      const after = val.slice(end);
+      textarea.value = before + replacement + after;
+
+      // Keep replacement selected so user can press shortcut repeatedly
+      textarea.selectionStart = start;
+      textarea.selectionEnd = start + replacement.length;
+      textarea.focus();
+    }
+
     // Booru Tag Autocomplete Controller
     // ---------------------------------------------------------------------------
     const promptEl = $('#prompt');
@@ -2413,6 +2499,18 @@ INDEX_HTML = r'''<!doctype html>
       });
 
       promptEl.addEventListener('keydown', e => {
+        // Ctrl+Up / Ctrl+Down (or Ctrl+Shift+Up / Ctrl+Shift+Down) to adjust tag weights (like A1111)
+        if (e.ctrlKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+          e.preventDefault();
+          adjustPromptWeight(promptEl, e.key === 'ArrowUp' ? 0.1 : -0.1);
+          return;
+        }
+        if (e.ctrlKey && e.key === 'Enter') {
+          e.preventDefault();
+          startGenerate();
+          return;
+        }
+
         if (acMenu.style.display !== 'block') return;
         if (e.key === 'ArrowDown') {
           e.preventDefault();
@@ -2432,6 +2530,20 @@ INDEX_HTML = r'''<!doctype html>
         }
       });
     }
+
+
+      const negEl = $('#negative');
+      if (negEl) {
+        negEl.addEventListener('keydown', e => {
+          if (e.ctrlKey && (e.key === 'ArrowUp' || e.key === 'ArrowDown')) {
+            e.preventDefault();
+            adjustPromptWeight(negEl, e.key === 'ArrowUp' ? 0.1 : -0.1);
+          } else if (e.ctrlKey && e.key === 'Enter') {
+            e.preventDefault();
+            startGenerate();
+          }
+        });
+      }
 
     function renderAutocomplete(tags) {
       if (!tags.length) {
