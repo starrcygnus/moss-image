@@ -496,15 +496,21 @@ DOWNLOAD_LOCK = threading.Lock()
 def download_file_robust(final_url, dest_dir, fname, headers=None):
     global DOWNLOAD_STATE
     UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    
+    # Check if final_url is an AWS S3 / Cloudflare R2 presigned URL
+    is_presigned = any(k in final_url for k in ["X-Amz-Signature", "X-Amz-Algorithm", "r2.cloudflarestorage.com", "amazonaws.com"])
+    send_auth = bool(headers and headers.get("Authorization") and not is_presigned)
+
     cmd = [
         "aria2c", "-x", "16", "-s", "16", "-k", "1M", "-c", "--file-allocation=none",
         "--console-log-level=warn", "--summary-interval=1",
         f"--user-agent={UA}",
-        "--header=Referer: https://civitai.com/",
         "--check-certificate=false",
         "-d", dest_dir, "-o", fname, final_url
     ]
-    if headers and headers.get("Authorization"):
+    if not is_presigned:
+        cmd.append("--header=Referer: https://civitai.com/")
+    if send_auth:
         cmd.extend(["--header", f"Authorization: {headers['Authorization']}"])
 
     err_lines = []
@@ -535,10 +541,13 @@ def download_file_robust(final_url, dest_dir, fname, headers=None):
     if not aria_ok:
         out_path = os.path.join(dest_dir, fname)
         DOWNLOAD_STATE["msg"] = f"Streaming {fname} via direct connection..."
-        req_headers = {"User-Agent": UA, "Referer": "https://civitai.com/"}
-        if headers:
-            req_headers.update(headers)
-        with requests.get(final_url, headers=req_headers, stream=True, timeout=60) as r:
+        req_headers = {"User-Agent": UA}
+        if not is_presigned:
+            req_headers["Referer"] = "https://civitai.com/"
+        if send_auth:
+            req_headers["Authorization"] = headers["Authorization"]
+
+        with requests.get(final_url, headers=req_headers, stream=True, timeout=120) as r:
             r.raise_for_status()
             total_len = int(r.headers.get("content-length", 0))
             dl_bytes = 0
@@ -582,8 +591,16 @@ def run_download_task(raw_entry, target_type, civitai_key, custom_name_override=
                 url = f"https://civitai.com/models/{mid}"
 
         domain = urllib.parse.urlparse(url).netloc.lower()
+        is_presigned = any(k in url for k in ["X-Amz-Signature", "X-Amz-Algorithm", "r2.cloudflarestorage.com", "amazonaws.com"])
+
         if target_type == "auto":
-            if "civitai" in domain:
+            if is_presigned:
+                test_str = (url + " " + (custom_name or "")).lower()
+                if any(k in test_str for k in ["checkpoint", "diffusion_models", "diffusion_model"]):
+                    target_type = "checkpoint"
+                else:
+                    target_type = "lora"
+            elif "civitai" in domain:
                 parsed = urllib.parse.urlparse(url)
                 m_page = re.search(r"/models/(\d+)", parsed.path)
                 m_dl = re.search(r"/api/download/models/(\d+)", parsed.path)
@@ -607,7 +624,7 @@ def run_download_task(raw_entry, target_type, civitai_key, custom_name_override=
                 except Exception:
                     pass
             if target_type == "auto":
-                if any(k in url.lower() for k in ["checkpoint", "diffusion_models", "diffusion", "anima", "unet"]):
+                if any(k in url.lower() for k in ["checkpoint", "diffusion_models", "diffusion"]):
                     target_type = "checkpoint"
                 else:
                     target_type = "lora"
@@ -641,6 +658,13 @@ def run_download_task(raw_entry, target_type, civitai_key, custom_name_override=
                     os.replace(out_path, new_path)
                     out_path = new_path
                 fname = os.path.basename(out_path)
+
+        elif is_presigned:
+            DOWNLOAD_STATE["msg"] = f"Downloading {label} from direct storage link..."
+            fname = custom_name or filename_from_headers({}, url) or urllib.parse.unquote(url.split("?")[0].rstrip("/").split("/")[-1])
+            fname = ensure_valid_ext(fname)
+            DOWNLOAD_STATE["filename"] = fname
+            download_file_robust(url, dest_dir, fname, headers=None)
 
         elif "civitai" in domain:
             DOWNLOAD_STATE["msg"] = "Connecting to Civitai API..."
@@ -711,7 +735,7 @@ def run_download_task(raw_entry, target_type, civitai_key, custom_name_override=
 
             DOWNLOAD_STATE["filename"] = fname
             DOWNLOAD_STATE["msg"] = f"Downloading {fname}..."
-            download_file_robust(final_url, dest_dir, fname, headers)
+            download_file_robust(final_url, dest_dir, fname, headers=None)
 
         else:
             if "huggingface.co" in domain and "/blob/" in url:
@@ -723,9 +747,9 @@ def run_download_task(raw_entry, target_type, civitai_key, custom_name_override=
             download_file_robust(url, dest_dir, fname)
 
         DOWNLOAD_STATE["percent"] = 100
+        DOWNLOAD_STATE["msg"] = f"Successfully downloaded {DOWNLOAD_STATE.get('filename')}!"
         DOWNLOAD_STATE["status"] = "done"
-        DOWNLOAD_STATE["msg"] = f"✓ {fname} ready! Added to {label}s."
-        DOWNLOAD_STATE["filename"] = fname
+
     except Exception as e:
         import traceback
         traceback.print_exc()
@@ -736,7 +760,6 @@ def run_download_task(raw_entry, target_type, civitai_key, custom_name_override=
         DOWNLOAD_STATE["active"] = False
 
 # ---------------------------------------------------------------------------
-# Flask App Setup
 # ---------------------------------------------------------------------------
 app = Flask(__name__)
 
