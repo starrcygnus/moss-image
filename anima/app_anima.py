@@ -11,6 +11,8 @@ import urllib.parse
 import csv
 import time
 import shutil
+import hashlib
+import struct
 from flask import Flask, Response, jsonify, request
 
 COMFY = os.environ.get("COMFY_URL", "http://127.0.0.1:8188").rstrip("/")
@@ -91,6 +93,177 @@ def save_output_to_drive(local_path, seed):
     except Exception as e:
         print(f"Google Drive output backup note: {e}")
         return None
+
+# ---------------------------------------------------------------------------
+# LoRA Trigger Word Helpers (Sidecar .civitai.info / .json / .txt + Civitai)
+# ---------------------------------------------------------------------------
+LORA_TRIGGER_CACHE_FILE = os.path.join(HERE, "lora_triggers_cache.json")
+
+def _normalize_trigger_list(raw):
+    items = []
+    if isinstance(raw, str):
+        parts = [p.strip() for p in re.split(r"[,\n]+", raw) if p.strip()]
+        items.extend(parts)
+    elif isinstance(raw, list):
+        for entry in raw:
+            if isinstance(entry, str) and entry.strip():
+                # Keep multi-word phrases intact, split comma-joined strings
+                for p in entry.split(","):
+                    p = p.strip()
+                    if p and p not in items:
+                        items.append(p)
+    return items
+
+def _extract_triggers_from_json(data):
+    if not isinstance(data, dict):
+        return []
+    for key in ("trainedWords", "activation text", "activation_text", "trigger_words", "triggers"):
+        if key in data and data[key]:
+            res = _normalize_trigger_list(data[key])
+            if res:
+                return res
+    civitai_sub = data.get("civitai")
+    if isinstance(civitai_sub, dict):
+        res = _normalize_trigger_list(civitai_sub.get("trainedWords"))
+        if res:
+            return res
+    return []
+
+def _read_safetensors_explicit_triggers(path):
+    try:
+        with open(path, "rb") as f:
+            raw_len = f.read(8)
+            if len(raw_len) < 8:
+                return []
+            header_len = struct.unpack("<Q", raw_len)[0]
+            if header_len <= 0 or header_len > 10 * 1024 * 1024:
+                return []
+            header = json.loads(f.read(header_len).decode("utf-8", errors="ignore"))
+        meta = header.get("__metadata__", {})
+        if not isinstance(meta, dict):
+            return []
+        for k in ("modelspec.trigger_phrase", "ss_activation_tags", "ss_trigger_word", "trigger_phrase"):
+            val = meta.get(k)
+            if val:
+                res = _normalize_trigger_list(val)
+                if res:
+                    return res
+    except Exception:
+        pass
+    return []
+
+def _find_lora_file_path(rel_name):
+    rel_clean = (rel_name or "").replace("\\", "/").lstrip("/")
+    if not rel_clean or rel_clean == "None" or ".." in rel_clean.split("/"):
+        return None
+    candidates = [os.path.join(COMFY_DIR, "models", "loras", rel_clean)]
+    cfg = get_drive_config()
+    if cfg["connected"]:
+        candidates.append(os.path.join(cfg["models_dir"], "loras", rel_clean))
+    for cand in candidates:
+        if os.path.isfile(cand):
+            return cand
+    return None
+
+def _load_trigger_cache():
+    if os.path.isfile(LORA_TRIGGER_CACHE_FILE):
+        try:
+            with open(LORA_TRIGGER_CACHE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f) or {}
+        except Exception:
+            pass
+    return {}
+
+def _save_trigger_cache(cache_data):
+    try:
+        with open(LORA_TRIGGER_CACHE_FILE, "w", encoding="utf-8") as f:
+            json.dump(cache_data, f, indent=2)
+    except Exception:
+        pass
+
+def save_civitai_sidecar(model_path, vdata):
+    if not model_path or not isinstance(vdata, dict):
+        return
+    try:
+        stem = os.path.splitext(model_path)[0]
+        sidecar = stem + ".civitai.info"
+        payload = {
+            "id": vdata.get("id"),
+            "modelId": vdata.get("modelId"),
+            "name": vdata.get("name"),
+            "trainedWords": vdata.get("trainedWords") or [],
+            "baseModel": vdata.get("baseModel"),
+        }
+        with open(sidecar, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=False)
+    except Exception as e:
+        print(f"Sidecar metadata note: {e}")
+
+def get_lora_triggers_data(rel_name, fetch_civitai=False):
+    lora_path = _find_lora_file_path(rel_name)
+    if not lora_path:
+        return {"name": rel_name, "triggers": [], "source": "not_found"}
+
+    stem = os.path.splitext(lora_path)[0]
+    # 1) Check sidecar JSON files (.civitai.info, .metadata.json, .json)
+    for ext, src_name in ((".civitai.info", "civitai.info"), (".metadata.json", "metadata.json"), (".json", "json")):
+        p = stem + ext
+        if os.path.isfile(p):
+            try:
+                with open(p, "r", encoding="utf-8") as f:
+                    triggers = _extract_triggers_from_json(json.load(f))
+                if triggers:
+                    return {"name": rel_name, "triggers": triggers, "source": src_name}
+            except Exception:
+                pass
+
+    # 2) Check plain .txt sidecar (one per line or comma-separated)
+    txt_path = stem + ".txt"
+    if os.path.isfile(txt_path):
+        try:
+            with open(txt_path, "r", encoding="utf-8", errors="ignore") as f:
+                lines = [ln.strip() for ln in f if ln.strip() and not ln.strip().startswith("#")]
+            triggers = _normalize_trigger_list(",".join(lines))
+            if triggers:
+                return {"name": rel_name, "triggers": triggers, "source": "txt"}
+        except Exception:
+            pass
+
+    # 3) Check local cache
+    cache = _load_trigger_cache()
+    if rel_name in cache and cache[rel_name].get("triggers"):
+        return {"name": rel_name, "triggers": cache[rel_name]["triggers"], "source": cache[rel_name].get("source", "cache")}
+
+    # 4) Explicit trigger fields inside .safetensors header
+    st_triggers = _read_safetensors_explicit_triggers(lora_path)
+    if st_triggers:
+        return {"name": rel_name, "triggers": st_triggers, "source": "safetensors"}
+
+    # 5) On-demand Civitai SHA256 hash lookup
+    if fetch_civitai:
+        try:
+            h = hashlib.sha256()
+            with open(lora_path, "rb") as f:
+                while True:
+                    chunk = f.read(4 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    h.update(chunk)
+            sha = h.hexdigest().upper()
+            r = requests.get(f"https://civitai.com/api/v1/model-versions/by-hash/{sha}", timeout=20)
+            if r.status_code == 200:
+                vdata = r.json()
+                triggers = _normalize_trigger_list(vdata.get("trainedWords") or [])
+                save_civitai_sidecar(lora_path, vdata)
+                cache[rel_name] = {"triggers": triggers, "source": "civitai_hash", "sha256": sha}
+                _save_trigger_cache(cache)
+                return {"name": rel_name, "triggers": triggers, "source": "civitai_hash"}
+            elif r.status_code == 404:
+                return {"name": rel_name, "triggers": [], "source": "civitai_not_found"}
+        except Exception as e:
+            return {"name": rel_name, "triggers": [], "source": "error", "error": str(e)}
+
+    return {"name": rel_name, "triggers": [], "source": "none"}
 
 # ---------------------------------------------------------------------------
 # PNG Metadata Embedder (A1111 + ComfyUI workflow)
@@ -873,17 +1046,19 @@ def run_download_task(raw_entry, target_type, civitai_key, custom_name_override=
                     version_id = str(versions[0]["id"])
                 dl_url = f"https://civitai.com/api/download/models/{version_id}"
 
-            if version_id and not fname:
+            civitai_vdata = None
+            if version_id:
                 try:
                     r_ver = requests.get(f"https://civitai.com/api/v1/model-versions/{version_id}", headers=headers, timeout=30)
                     if r_ver.status_code == 200:
-                        vdata = r_ver.json()
-                        files = vdata.get("files") or []
-                        chosen = next((f for f in files if f.get("primary")), files[0] if files else None)
-                        if chosen:
-                            fname = chosen.get("name")
-                            if chosen.get("downloadUrl"):
-                                dl_url = chosen["downloadUrl"]
+                        civitai_vdata = r_ver.json()
+                        if not fname:
+                            files = civitai_vdata.get("files") or []
+                            chosen = next((f for f in files if f.get("primary")), files[0] if files else None)
+                            if chosen:
+                                fname = chosen.get("name")
+                                if chosen.get("downloadUrl"):
+                                    dl_url = chosen["downloadUrl"]
                 except Exception:
                     pass
 
@@ -913,6 +1088,8 @@ def run_download_task(raw_entry, target_type, civitai_key, custom_name_override=
             DOWNLOAD_STATE["filename"] = fname
             DOWNLOAD_STATE["msg"] = f"Downloading {fname}..."
             download_file_robust(final_url, dest_dir, fname, headers=None)
+            if civitai_vdata:
+                save_civitai_sidecar(os.path.join(dest_dir, fname), civitai_vdata)
 
         else:
             if "huggingface.co" in domain and "/blob/" in url:
@@ -1089,6 +1266,14 @@ def get_models():
         resolutions=RESOLUTIONS,
         gdrive=drive_cfg
     )
+
+@app.get("/api/lora_triggers")
+def api_lora_triggers():
+    name = (request.args.get("name") or "").strip()
+    fetch_civitai = (request.args.get("fetch_civitai") or "").lower() in ("1", "true", "yes")
+    if not name or name == "None":
+        return jsonify(name=name, triggers=[], source="none")
+    return jsonify(get_lora_triggers_data(name, fetch_civitai=fetch_civitai))
 
 @app.get("/api/tags")
 def search_tags():
@@ -2034,12 +2219,17 @@ INDEX_HTML = r'''<!doctype html>
         <div class="accordion" style="margin-top:4px;">
           <div class="accordion-header" onclick="toggleAcc(this)">
             <span>🎛️ LoRA Rack (6 Slots Active)</span>
-            <span id="lora-active-badge" style="font-size:10px; color:var(--accent);">0 active</span>
+            <div class="row" style="gap:8px; align-items:center;" onclick="event.stopPropagation()">
+              <label style="display:flex; align-items:center; gap:4px; font-size:10.5px; color:var(--text-muted); cursor:pointer;" title="Automatically insert/remove trigger words when selecting a LoRA">
+                <input type="checkbox" id="lora-auto-triggers" checked style="accent-color:var(--accent); cursor:pointer;"> Auto-triggers
+              </label>
+              <span id="lora-active-badge" style="font-size:10px; color:var(--accent);">0 active</span>
+            </div>
           </div>
           <div class="accordion-body" id="lora-rack-body" style="display:flex; flex-direction:column; gap:8px; padding:8px;">
             <div class="lora-slot" id="slot-card-1">
               <div class="lora-header">
-                <label><input type="checkbox" id="lora-1-on" checked onchange="updateLoraBadge()"> Slot 1</label>
+                <label><input type="checkbox" id="lora-1-on" checked onchange="onLoraSlotChanged(1)"> Slot 1</label>
                 <div class="row" style="gap:4px; align-items:center;">
                   <span style="font-size:10px; color:var(--text-muted);">Weight:</span>
                   <input type="number" id="lora-1-num" step="0.05" min="-5.0" max="10.0" value="1.0"
@@ -2049,16 +2239,17 @@ INDEX_HTML = r'''<!doctype html>
                 </div>
               </div>
               <div class="row" style="margin-top:2px;">
-                <select id="lora-1-name" style="flex:1;" onchange="updateLoraBadge()">
+                <select id="lora-1-name" style="flex:1;" onchange="onLoraSlotChanged(1)">
                   <option value="None">None</option>
                 </select>
                 <input type="range" id="lora-1-str" min="-2.0" max="5.0" step="0.05" value="1.0" style="width:130px;"
                   oninput="syncLoraWeight(1, 'range')">
               </div>
+              <div id="lora-1-triggers" style="display:none; flex-wrap:wrap; gap:4px; margin-top:4px; align-items:center;"></div>
             </div>
             <div class="lora-slot" id="slot-card-2">
               <div class="lora-header">
-                <label><input type="checkbox" id="lora-2-on" checked onchange="updateLoraBadge()"> Slot 2</label>
+                <label><input type="checkbox" id="lora-2-on" checked onchange="onLoraSlotChanged(2)"> Slot 2</label>
                 <div class="row" style="gap:4px; align-items:center;">
                   <span style="font-size:10px; color:var(--text-muted);">Weight:</span>
                   <input type="number" id="lora-2-num" step="0.05" min="-5.0" max="10.0" value="1.0"
@@ -2068,16 +2259,17 @@ INDEX_HTML = r'''<!doctype html>
                 </div>
               </div>
               <div class="row" style="margin-top:2px;">
-                <select id="lora-2-name" style="flex:1;" onchange="updateLoraBadge()">
+                <select id="lora-2-name" style="flex:1;" onchange="onLoraSlotChanged(2)">
                   <option value="None">None</option>
                 </select>
                 <input type="range" id="lora-2-str" min="-2.0" max="5.0" step="0.05" value="1.0" style="width:130px;"
                   oninput="syncLoraWeight(2, 'range')">
               </div>
+              <div id="lora-2-triggers" style="display:none; flex-wrap:wrap; gap:4px; margin-top:4px; align-items:center;"></div>
             </div>
             <div class="lora-slot" id="slot-card-3">
               <div class="lora-header">
-                <label><input type="checkbox" id="lora-3-on" checked onchange="updateLoraBadge()"> Slot 3</label>
+                <label><input type="checkbox" id="lora-3-on" checked onchange="onLoraSlotChanged(3)"> Slot 3</label>
                 <div class="row" style="gap:4px; align-items:center;">
                   <span style="font-size:10px; color:var(--text-muted);">Weight:</span>
                   <input type="number" id="lora-3-num" step="0.05" min="-5.0" max="10.0" value="1.0"
@@ -2087,16 +2279,17 @@ INDEX_HTML = r'''<!doctype html>
                 </div>
               </div>
               <div class="row" style="margin-top:2px;">
-                <select id="lora-3-name" style="flex:1;" onchange="updateLoraBadge()">
+                <select id="lora-3-name" style="flex:1;" onchange="onLoraSlotChanged(3)">
                   <option value="None">None</option>
                 </select>
                 <input type="range" id="lora-3-str" min="-2.0" max="5.0" step="0.05" value="1.0" style="width:130px;"
                   oninput="syncLoraWeight(3, 'range')">
               </div>
+              <div id="lora-3-triggers" style="display:none; flex-wrap:wrap; gap:4px; margin-top:4px; align-items:center;"></div>
             </div>
             <div class="lora-slot" id="slot-card-4">
               <div class="lora-header">
-                <label><input type="checkbox" id="lora-4-on" checked onchange="updateLoraBadge()"> Slot 4</label>
+                <label><input type="checkbox" id="lora-4-on" checked onchange="onLoraSlotChanged(4)"> Slot 4</label>
                 <div class="row" style="gap:4px; align-items:center;">
                   <span style="font-size:10px; color:var(--text-muted);">Weight:</span>
                   <input type="number" id="lora-4-num" step="0.05" min="-5.0" max="10.0" value="1.0"
@@ -2106,16 +2299,17 @@ INDEX_HTML = r'''<!doctype html>
                 </div>
               </div>
               <div class="row" style="margin-top:2px;">
-                <select id="lora-4-name" style="flex:1;" onchange="updateLoraBadge()">
+                <select id="lora-4-name" style="flex:1;" onchange="onLoraSlotChanged(4)">
                   <option value="None">None</option>
                 </select>
                 <input type="range" id="lora-4-str" min="-2.0" max="5.0" step="0.05" value="1.0" style="width:130px;"
                   oninput="syncLoraWeight(4, 'range')">
               </div>
+              <div id="lora-4-triggers" style="display:none; flex-wrap:wrap; gap:4px; margin-top:4px; align-items:center;"></div>
             </div>
             <div class="lora-slot" id="slot-card-5">
               <div class="lora-header">
-                <label><input type="checkbox" id="lora-5-on" checked onchange="updateLoraBadge()"> Slot 5</label>
+                <label><input type="checkbox" id="lora-5-on" checked onchange="onLoraSlotChanged(5)"> Slot 5</label>
                 <div class="row" style="gap:4px; align-items:center;">
                   <span style="font-size:10px; color:var(--text-muted);">Weight:</span>
                   <input type="number" id="lora-5-num" step="0.05" min="-5.0" max="10.0" value="1.0"
@@ -2125,16 +2319,17 @@ INDEX_HTML = r'''<!doctype html>
                 </div>
               </div>
               <div class="row" style="margin-top:2px;">
-                <select id="lora-5-name" style="flex:1;" onchange="updateLoraBadge()">
+                <select id="lora-5-name" style="flex:1;" onchange="onLoraSlotChanged(5)">
                   <option value="None">None</option>
                 </select>
                 <input type="range" id="lora-5-str" min="-2.0" max="5.0" step="0.05" value="1.0" style="width:130px;"
                   oninput="syncLoraWeight(5, 'range')">
               </div>
+              <div id="lora-5-triggers" style="display:none; flex-wrap:wrap; gap:4px; margin-top:4px; align-items:center;"></div>
             </div>
             <div class="lora-slot" id="slot-card-6">
               <div class="lora-header">
-                <label><input type="checkbox" id="lora-6-on" checked onchange="updateLoraBadge()"> Slot 6</label>
+                <label><input type="checkbox" id="lora-6-on" checked onchange="onLoraSlotChanged(6)"> Slot 6</label>
                 <div class="row" style="gap:4px; align-items:center;">
                   <span style="font-size:10px; color:var(--text-muted);">Weight:</span>
                   <input type="number" id="lora-6-num" step="0.05" min="-5.0" max="10.0" value="1.0"
@@ -2144,12 +2339,13 @@ INDEX_HTML = r'''<!doctype html>
                 </div>
               </div>
               <div class="row" style="margin-top:2px;">
-                <select id="lora-6-name" style="flex:1;" onchange="updateLoraBadge()">
+                <select id="lora-6-name" style="flex:1;" onchange="onLoraSlotChanged(6)">
                   <option value="None">None</option>
                 </select>
                 <input type="range" id="lora-6-str" min="-2.0" max="5.0" step="0.05" value="1.0" style="width:130px;"
                   oninput="syncLoraWeight(6, 'range')">
               </div>
+              <div id="lora-6-triggers" style="display:none; flex-wrap:wrap; gap:4px; margin-top:4px; align-items:center;"></div>
             </div>
           </div>
         </div>
@@ -2397,6 +2593,126 @@ INDEX_HTML = r'''<!doctype html>
         if (sel && sel.value !== 'None' && chk && chk.checked) count++;
       }
       $('#lora-active-badge').innerText = `${count} active`;
+    }
+
+    gState.slotTriggers = { 1: [], 2: [], 3: [], 4: [], 5: [], 6: [] };
+
+    function _cleanTagNorm(t) {
+      return (t || '').trim().replace(/^\(+/, '').replace(/(?::[\d.]+)?\)+$/, '').trim().toLowerCase();
+    }
+
+    function _syncSlotTriggersToPrompt(slotIdx, newTriggers) {
+      const p = $('#prompt');
+      if (!p) return;
+      const oldTriggers = gState.slotTriggers[slotIdx] || [];
+      gState.slotTriggers[slotIdx] = newTriggers ? [...newTriggers] : [];
+
+      const activeElsewhere = new Set();
+      for (let i = 1; i <= 6; i++) {
+        if (i !== slotIdx) {
+          (gState.slotTriggers[i] || []).forEach(t => activeElsewhere.add(_cleanTagNorm(t)));
+        }
+      }
+      const removeSet = new Set(
+        oldTriggers.map(_cleanTagNorm).filter(nt => nt && !activeElsewhere.has(nt))
+      );
+
+      let tokens = p.value.split(',').map(s => s.trim()).filter(Boolean);
+      if (removeSet.size > 0) {
+        tokens = tokens.filter(tok => !removeSet.has(_cleanTagNorm(tok)));
+      }
+
+      const existingNorms = new Set(tokens.map(_cleanTagNorm));
+      const added = [];
+      (newTriggers || []).forEach(t => {
+        const clean = _cleanTagNorm(t);
+        if (clean && !existingNorms.has(clean)) {
+          tokens.push(t.trim());
+          existingNorms.add(clean);
+          added.push(t.trim());
+        }
+      });
+
+      p.value = tokens.join(', ');
+      return added;
+    }
+
+    function insertTriggerWord(t) {
+      const p = $('#prompt');
+      if (!p || !t) return;
+      let tokens = p.value.split(',').map(s => s.trim()).filter(Boolean);
+      const norm = _cleanTagNorm(t);
+      if (tokens.some(tok => _cleanTagNorm(tok) === norm)) {
+        tokens = tokens.filter(tok => _cleanTagNorm(tok) !== norm);
+        p.value = tokens.join(', ');
+      } else {
+        tokens.push(t.trim());
+        p.value = tokens.join(', ');
+      }
+    }
+
+    function renderSlotTriggerChips(slotIdx, loraName, data) {
+      const box = $(`#lora-${slotIdx}-triggers`);
+      if (!box) return;
+      if (!loraName || loraName === 'None') {
+        box.style.display = 'none';
+        box.innerHTML = '';
+        return;
+      }
+      const triggers = (data && data.triggers) || [];
+      box.style.display = 'flex';
+      if (triggers.length > 0) {
+        let html = `<span style="font-size:10px; color:var(--text-muted);">Triggers:</span>`;
+        triggers.forEach(t => {
+          const safeAttr = t.replace(/&/g, '&amp;').replace(/"/g, '&quot;').replace(/</g, '&lt;');
+          html += `<button type="button" class="btn-sub" style="padding:1px 6px; font-size:10px; border-color:rgba(168,85,247,0.45);" onclick="insertTriggerWord(this.dataset.tag)" data-tag="${safeAttr}" title="Click to add/remove in prompt">+ ${safeAttr}</button>`;
+        });
+        box.innerHTML = html;
+      } else {
+        box.innerHTML = `<button type="button" class="btn-sub" style="padding:1px 6px; font-size:10px; color:var(--text-muted);" onclick="lookupCivitaiTriggers(${slotIdx})" title="Hash LoRA & fetch trainedWords from Civitai API">🔍 Fetch Civitai Triggers</button>`;
+      }
+    }
+
+    async function lookupCivitaiTriggers(slotIdx) {
+      const box = $(`#lora-${slotIdx}-triggers`);
+      if (box) box.innerHTML = `<span style="font-size:10px; color:var(--accent);">⏳ Checking Civitai by hash...</span>`;
+      await onLoraSlotChanged(slotIdx, true);
+    }
+
+    async function onLoraSlotChanged(slotIdx, fetchCivitai = false) {
+      updateLoraBadge();
+      const sel = $(`#lora-${slotIdx}-name`);
+      const chk = $(`#lora-${slotIdx}-on`);
+      const loraName = sel ? sel.value : 'None';
+      const enabled = chk ? chk.checked : false;
+      const autoOn = $('#lora-auto-triggers') ? $('#lora-auto-triggers').checked : true;
+
+      if (!enabled || !loraName || loraName === 'None') {
+        if (autoOn) _syncSlotTriggersToPrompt(slotIdx, []);
+        else gState.slotTriggers[slotIdx] = [];
+        renderSlotTriggerChips(slotIdx, enabled ? loraName : 'None', null);
+        return;
+      }
+
+      try {
+        const res = await fetch(`/api/lora_triggers?name=${encodeURIComponent(loraName)}&fetch_civitai=${fetchCivitai ? '1' : '0'}`);
+        const data = await res.json();
+        // Verify slot didn't change mid-flight
+        if ($(`#lora-${slotIdx}-name`).value !== loraName) return;
+
+        renderSlotTriggerChips(slotIdx, loraName, data);
+        const triggers = data.triggers || [];
+        if (autoOn) {
+          const added = _syncSlotTriggersToPrompt(slotIdx, triggers);
+          if (added && added.length > 0) {
+            showToast(`Added triggers: ${added.join(', ')}`, 'info', 2500);
+          } else if (fetchCivitai && triggers.length === 0) {
+            showToast('No trigger words found on Civitai for this LoRA.', 'info', 2500);
+          }
+        }
+      } catch (e) {
+        console.warn('Trigger lookup note:', e);
+      }
     }
 
     // Reference Image Upload
