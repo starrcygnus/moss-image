@@ -10,6 +10,7 @@ import subprocess
 import urllib.parse
 import csv
 import time
+import shutil
 from flask import Flask, Response, jsonify, request
 
 COMFY = os.environ.get("COMFY_URL", "http://127.0.0.1:8188").rstrip("/")
@@ -19,6 +20,77 @@ WD_DIR = os.environ.get("WD_TAGGER_DIR", "/content/wd_tagger")
 CLIENT_ID = uuid.uuid4().hex
 
 JOB_PARAMS = {}
+DRIVE_CONFIG_PATH = os.path.join(HERE, "drive_config.json")
+DRIVE_RUNTIME_OVERRIDE = {"save_outputs": None}
+
+def _normalize_drive_models_dir(path):
+    if not path:
+        return ""
+    path = os.path.normpath(path)
+    if os.path.isdir(os.path.join(path, "models")) and not any(
+        os.path.isdir(os.path.join(path, sub))
+        for sub in ("loras", "unet", "diffusion_models", "vae", "clip", "text_encoders")
+    ):
+        return os.path.join(path, "models")
+    return path
+
+def get_drive_config():
+    cfg = {}
+    if os.path.isfile(DRIVE_CONFIG_PATH):
+        try:
+            with open(DRIVE_CONFIG_PATH, "r", encoding="utf-8") as f:
+                cfg = json.load(f) or {}
+        except Exception:
+            cfg = {}
+
+    use_gdrive = cfg.get("use_gdrive", False)
+    models_dir = os.environ.get("GDRIVE_MODELS_DIR") or cfg.get("models_dir", "")
+    output_dir = os.environ.get("GDRIVE_OUTPUT_DIR") or cfg.get("output_dir", "")
+
+    if os.environ.get("GDRIVE_MODELS_DIR"):
+        use_gdrive = True
+
+    models_dir = _normalize_drive_models_dir(models_dir) if models_dir else ""
+    if not output_dir and models_dir:
+        base_comfy = os.path.dirname(models_dir.rstrip("/\\"))
+        output_dir = os.path.join(base_comfy, "output")
+
+    drive_mounted = os.path.isdir("/content/drive/MyDrive") or (bool(models_dir) and os.path.isdir(models_dir))
+    connected = bool(use_gdrive and drive_mounted and models_dir and os.path.isdir(models_dir))
+
+    env_save = os.environ.get("SAVE_OUTPUTS_TO_DRIVE")
+    if DRIVE_RUNTIME_OVERRIDE["save_outputs"] is not None:
+        save_outputs = bool(DRIVE_RUNTIME_OVERRIDE["save_outputs"])
+    elif env_save is not None:
+        save_outputs = env_save.lower() in ("1", "true", "yes")
+    else:
+        save_outputs = bool(cfg.get("save_outputs", True))
+
+    return {
+        "connected": connected,
+        "models_dir": models_dir if connected else "",
+        "output_dir": output_dir if connected else "",
+        "save_outputs": save_outputs if connected else False,
+    }
+
+def save_output_to_drive(local_path, seed):
+    cfg = get_drive_config()
+    if not (cfg["connected"] and cfg["save_outputs"] and cfg["output_dir"] and os.path.isfile(local_path)):
+        return None
+    try:
+        date_dir = os.path.join(cfg["output_dir"], time.strftime("%Y-%m-%d"))
+        os.makedirs(date_dir, exist_ok=True)
+        stem, ext = os.path.splitext(os.path.basename(local_path))
+        candidate = os.path.join(date_dir, f"{stem}_seed{seed}{ext}")
+        counter = 1
+        while os.path.exists(candidate):
+            candidate = os.path.join(date_dir, f"{stem}_seed{seed}_{counter}{ext}")
+            counter += 1
+        shutil.copy2(local_path, candidate)
+        return candidate
+    except Exception as e:
+        print(f"Google Drive output backup note: {e}")
+        return None
 
 # ---------------------------------------------------------------------------
 # PNG Metadata Embedder (A1111 + ComfyUI workflow)
@@ -153,6 +225,25 @@ RESOLUTIONS = {
 # ---------------------------------------------------------------------------
 # Workflow Builder
 # ---------------------------------------------------------------------------
+def resolve_comfy_asset(node_type, input_key, preferred, keywords):
+    try:
+        info = comfy_get(f"/object_info/{node_type}")
+        choices = info.get(node_type, {}).get("input", {}).get("required", {}).get(input_key, [[]])[0]
+        if isinstance(choices, list) and choices:
+            if preferred in choices:
+                return preferred
+            pref_base = os.path.basename(preferred).lower()
+            for c in choices:
+                if os.path.basename(c).lower() == pref_base:
+                    return c
+            for kw in keywords:
+                for c in choices:
+                    if kw in c.lower():
+                        return c
+    except Exception:
+        pass
+    return preferred
+
 def build_workflow(p):
     wf = copy.deepcopy(WORKFLOW)
     seed = clamp(p.get("seed", -1), -1, 2**50, int, -1)
@@ -185,9 +276,15 @@ def build_workflow(p):
     wf["6"]["inputs"]["width"] = w
     wf["6"]["inputs"]["height"] = h
 
-    # Checkpoint & Precision
+    # Checkpoint & Precision (+ Drive/subfolder-safe CLIP & VAE resolution)
     wf["1"]["inputs"]["unet_name"] = p.get("checkpoint") or DEFAULTS["checkpoint"]
     wf["1"]["inputs"]["weight_dtype"] = p.get("weight_dtype") or DEFAULTS.get("weight_dtype", "default")
+    wf["2"]["inputs"]["clip_name"] = resolve_comfy_asset(
+        "CLIPLoader", "clip_name", wf["2"]["inputs"]["clip_name"], ["qwen_3_06b", "qwen3", "qwen"]
+    )
+    wf["3"]["inputs"]["vae_name"] = resolve_comfy_asset(
+        "VAELoader", "vae_name", wf["3"]["inputs"]["vae_name"], ["qwen_image_vae", "qwen", "wan"]
+    )
 
     # Chain up to 6 LoRAs dynamically
     curr_model = ["1", 0]
@@ -632,7 +729,7 @@ def download_file_robust(final_url, dest_dir, fname, headers=None):
                         else:
                             DOWNLOAD_STATE["msg"] = f"Downloading: {dl_bytes // (1024*1024)}MB"
 
-def run_download_task(raw_entry, target_type, civitai_key, custom_name_override=""):
+def run_download_task(raw_entry, target_type, civitai_key, custom_name_override="", save_to_drive=False):
     global DOWNLOAD_STATE
     try:
         url = raw_entry.strip()
@@ -698,12 +795,23 @@ def run_download_task(raw_entry, target_type, civitai_key, custom_name_override=
                 else:
                     target_type = "lora"
 
-        dest_dir = os.path.join(COMFY_DIR, "models", "diffusion_models" if target_type == "checkpoint" else "loras")
+        drive_cfg = get_drive_config()
+        if save_to_drive and drive_cfg["connected"]:
+            if target_type == "checkpoint":
+                unet_d = os.path.join(drive_cfg["models_dir"], "unet")
+                diff_d = os.path.join(drive_cfg["models_dir"], "diffusion_models")
+                dest_dir = unet_d if os.path.isdir(unet_d) or not os.path.isdir(diff_d) else diff_d
+            else:
+                dest_dir = os.path.join(drive_cfg["models_dir"], "loras")
+            dest_label = "Google Drive"
+        else:
+            dest_dir = os.path.join(COMFY_DIR, "models", "diffusion_models" if target_type == "checkpoint" else "loras")
+            dest_label = "Colab local"
         os.makedirs(dest_dir, exist_ok=True)
         label = "Diffusion Model" if target_type == "checkpoint" else "LoRA"
 
         DOWNLOAD_STATE["target_type"] = target_type
-        DOWNLOAD_STATE["msg"] = f"Resolving download link for {label}..."
+        DOWNLOAD_STATE["msg"] = f"Resolving download link for {label} ({dest_label})..."
         DOWNLOAD_STATE["percent"] = 5
 
         if "drive.google.com" in domain or "docs.google.com" in domain:
@@ -888,24 +996,70 @@ def comfy_get(path):
     r.raise_for_status()
     return r.json()
 
+def _walk_model_files(base_dir, exts):
+    found = []
+    if not base_dir or not os.path.isdir(base_dir):
+        return found
+    for root, _, files in os.walk(base_dir):
+        for fn in files:
+            if fn.lower().endswith(exts):
+                rel = os.path.relpath(os.path.join(root, fn), base_dir).replace("\\", "/")
+                found.append(rel)
+    return found
+
 @app.get("/api/models")
 def get_models():
     diff_dir = os.path.join(COMFY_DIR, "models", "diffusion_models")
+    unet_dir = os.path.join(COMFY_DIR, "models", "unet")
     lora_dir = os.path.join(COMFY_DIR, "models", "loras")
-    
-    models = []
-    if os.path.isdir(diff_dir):
-        for f in os.listdir(diff_dir):
-            if f.lower().endswith((".safetensors", ".ckpt", ".pt", ".bin")):
-                models.append(f)
+    drive_cfg = get_drive_config()
+
+    diff_exts = (".safetensors", ".ckpt", ".pt", ".bin")
+    lora_exts = (".safetensors", ".pt")
+
+    model_set = []
+    def add_model(m):
+        if m and m not in model_set:
+            model_set.append(m)
+
+    lora_set = []
+    def add_lora(l):
+        if l and l != "None" and l not in lora_set:
+            lora_set.append(l)
+
+    # 1) Query ComfyUI's live indexed lists (includes extra_model_paths.yaml / Google Drive)
+    try:
+        u_info = comfy_get("/object_info/UNETLoader")
+        for m in u_info.get("UNETLoader", {}).get("input", {}).get("required", {}).get("unet_name", [[]])[0]:
+            add_model(m.replace("\\", "/"))
+    except Exception:
+        pass
+    try:
+        l_info = comfy_get("/object_info/LoraLoader")
+        for l in l_info.get("LoraLoader", {}).get("input", {}).get("required", {}).get("lora_name", [[]])[0]:
+            add_lora(l.replace("\\", "/"))
+    except Exception:
+        pass
+
+    # 2) Also walk local & Drive folders directly so newly downloaded files appear immediately
+    for d in [diff_dir, unet_dir]:
+        for m in sorted(_walk_model_files(d, diff_exts)):
+            add_model(m)
+    for m in sorted(_walk_model_files(lora_dir, lora_exts)):
+        add_lora(m)
+
+    if drive_cfg["connected"]:
+        for sub in ("unet", "diffusion_models"):
+            for m in sorted(_walk_model_files(os.path.join(drive_cfg["models_dir"], sub), diff_exts)):
+                add_model(m)
+        for m in sorted(_walk_model_files(os.path.join(drive_cfg["models_dir"], "loras"), lora_exts)):
+            add_lora(m)
+
+    models = sorted(model_set, key=lambda s: (0 if "anima" in s.lower() else 1, s.lower()))
     if not models:
         models = ["anima-base-v1.0.safetensors"]
 
-    loras = ["None"]
-    if os.path.isdir(lora_dir):
-        for f in sorted(os.listdir(lora_dir)):
-            if f.lower().endswith((".safetensors", ".pt")):
-                loras.append(f)
+    loras = ["None"] + sorted(lora_set, key=lambda s: s.lower())
 
     samplers = ["er_sde", "euler", "euler_ancestral", "dpmpp_2m", "dpmpp_sde", "dpmpp_2m_sde", "dpmpp_3m_sde", "dpmpp_sde_gpu", "ddim", "uni_pc", "heun", "lms"]
     schedulers = ["normal", "simple", "karras", "sgm_uniform", "exponential"]
@@ -932,7 +1086,8 @@ def get_models():
         loras=loras,
         samplers=samplers,
         schedulers=schedulers,
-        resolutions=RESOLUTIONS
+        resolutions=RESOLUTIONS,
+        gdrive=drive_cfg
     )
 
 @app.get("/api/tags")
@@ -1031,16 +1186,20 @@ def check_status(pid):
                     "type": img.get("type", "output")
                 })
         if images:
-            meta_info = JOB_PARAMS.get(pid, {})
+            meta_info = JOB_PARAMS.setdefault(pid, {})
             seed = meta_info.get("seed", "")
             final_img = images[-1]
             out_fn = final_img["filename"]
             local_path = os.path.join(COMFY_DIR, "output", final_img.get("subfolder", ""), out_fn)
-            embed_png_metadata(local_path, meta_info)
+            if not meta_info.get("finalized"):
+                embed_png_metadata(local_path, meta_info)
+                meta_info["drive_path"] = save_output_to_drive(local_path, seed)
+                meta_info["finalized"] = True
             return jsonify(
                 state="done",
                 images=images,
                 seed=seed,
+                saved_to_drive=meta_info.get("drive_path"),
                 download_name=f"{os.path.splitext(out_fn)[0]}_seed{seed}.png"
             )
         err = entry.get("status", {}).get("messages", [])
@@ -1129,6 +1288,13 @@ def tag_image_endpoint():
     except Exception as e:
         return jsonify(error=f"WD-EVA02 error: {str(e)}"), 500
 
+@app.post("/api/drive_settings")
+def update_drive_settings():
+    p = request.get_json(force=True, silent=True) or {}
+    if "save_outputs" in p:
+        DRIVE_RUNTIME_OVERRIDE["save_outputs"] = bool(p["save_outputs"])
+    return jsonify(gdrive=get_drive_config())
+
 @app.post("/api/download")
 def download_model():
     global DOWNLOAD_STATE
@@ -1137,6 +1303,7 @@ def download_model():
     target_type = (p.get("type") or p.get("folder") or "auto").strip().lower()
     civitai_key = (p.get("api_key") or p.get("civitai_key") or "").strip()
     custom_name = (p.get("filename") or "").strip()
+    save_to_drive = bool(p.get("save_to_drive", False))
 
     if not url:
         return jsonify(error="Please enter a valid URL or Civitai AIR identifier."), 400
@@ -1151,10 +1318,11 @@ def download_model():
             "msg": "Starting download...",
             "error": None,
             "filename": "",
-            "target_type": target_type
+            "target_type": target_type,
+            "save_to_drive": save_to_drive
         }
 
-    t = threading.Thread(target=run_download_task, args=(url, target_type, civitai_key, custom_name), daemon=True)
+    t = threading.Thread(target=run_download_task, args=(url, target_type, civitai_key, custom_name, save_to_drive), daemon=True)
     t.start()
     return jsonify(status="started")
 
@@ -1630,6 +1798,7 @@ INDEX_HTML = r'''<!doctype html>
         <button type="button" id="btn-mode-turbo" onclick="setPreset('turbo')">⚡ Turbo (8 Steps)</button>
         <button type="button" id="btn-mode-base" class="active" onclick="setPreset('base')">🎨 Base (35 Steps)</button>
       </div>
+      <button class="btn-sub" id="btn-drive-outputs" style="display:none;" onclick="toggleDriveOutputs()" title="Toggle saving generated images to Google Drive">☁️ Drive: ON</button>
       <button class="btn-sub" onclick="clearCache()" title="Clear GPU memory">🧹 VRAM</button>
     </div>
   </header>
@@ -1842,6 +2011,11 @@ INDEX_HTML = r'''<!doctype html>
               <input type="text" id="down-name" placeholder="custom_name.safetensors">
             </div>
 
+            <label id="down-gdrive-wrap" style="display:flex; align-items:center; gap:6px; font-size:11.5px; color:var(--text-muted); cursor:pointer; user-select:none; margin-top:2px;">
+              <input type="checkbox" id="down-gdrive" style="accent-color:var(--accent); cursor:pointer;">
+              <span>☁️ Save download to Google Drive <small id="down-gdrive-hint">(off = Colab local only)</small></span>
+            </label>
+
             <button class="btn-main" id="btn-start-down" onclick="startDownload()" style="margin-top:4px;">⬇️ Download to WebUI</button>
             <div id="down-status" style="font-size:11px; color:var(--text-muted); margin-top:4px; word-break:break-all; min-height:20px;"></div>
 
@@ -2034,8 +2208,59 @@ INDEX_HTML = r'''<!doctype html>
       models: [], loras: [], activeTab: 'gen',
       inputImage: null, taggerImage: null,
       currentPromptId: null, currentSeed: null,
-      currentFilename: null, history: []
+      currentFilename: null, history: [],
+      gdrive: { connected: false, save_outputs: false }
     };
+
+    function updateDriveUI() {
+      const gd = gState.gdrive || {};
+      const btn = $('#btn-drive-outputs');
+      if (btn) {
+        if (gd.connected) {
+          btn.style.display = 'inline-block';
+          btn.innerText = gd.save_outputs ? '☁️ Drive Save: ON' : '☁️ Drive Save: OFF';
+          btn.style.borderColor = gd.save_outputs ? 'var(--success)' : 'var(--border)';
+          btn.style.color = gd.save_outputs ? 'var(--success)' : 'var(--text-muted)';
+        } else {
+          btn.style.display = 'none';
+        }
+      }
+      const dlChk = $('#down-gdrive');
+      const dlHint = $('#down-gdrive-hint');
+      if (dlChk) {
+        dlChk.disabled = !gd.connected;
+        if (!gd.connected) {
+          dlChk.checked = false;
+          if (dlHint) dlHint.innerText = '(Drive not connected — saving locally)';
+        } else {
+          if (dlHint) dlHint.innerText = '(off = Colab local only)';
+        }
+      }
+    }
+
+    async function toggleDriveOutputs() {
+      const nextState = !(gState.gdrive && gState.gdrive.save_outputs);
+      try {
+        const res = await fetch('/api/drive_settings', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ save_outputs: nextState })
+        });
+        const data = await res.json();
+        if (data.gdrive) {
+          gState.gdrive = data.gdrive;
+          updateDriveUI();
+          showToast(
+            data.gdrive.save_outputs
+              ? `Saving new images to Google Drive (${data.gdrive.output_dir})`
+              : 'Paused saving new images to Google Drive',
+            'info'
+          );
+        }
+      } catch (e) {
+        showToast('Failed to update Drive output setting', 'error');
+      }
+    }
 
     function toggleAcc(el) {
       const body = el.nextElementSibling;
@@ -2095,6 +2320,8 @@ INDEX_HTML = r'''<!doctype html>
         const data = await res.json();
         gState.models = data.models || [];
         gState.loras = data.loras || [];
+        gState.gdrive = data.gdrive || { connected: false, save_outputs: false };
+        updateDriveUI();
 
         // Checkpoint dropdown
         const cp = $('#checkpoint');
@@ -2383,12 +2610,19 @@ INDEX_HTML = r'''<!doctype html>
         const data = await res.json();
         if (data.state === 'done') {
           setGeneratingState(false);
-          $('#gen-status').innerHTML = '<span>✓ Done</span>';
+          $('#gen-status').innerHTML = data.saved_to_drive
+            ? '<span>✓ Done (Saved to Drive)</span>'
+            : '<span>✓ Done</span>';
           const img = data.images[0];
           gState.currentFilename = img.filename;
           gState.currentSeed = data.seed;
           showImage(img.filename, data.seed);
-          showToast("Image generation complete!", "success");
+          showToast(
+            data.saved_to_drive
+              ? "Image complete & saved to Google Drive!"
+              : "Image generation complete!",
+            "success"
+          );
 
           const notifEl = $('#notif');
           if (!notifEl || notifEl.checked) {
@@ -2577,7 +2811,8 @@ INDEX_HTML = r'''<!doctype html>
             url: url,
             type: $('#down-type').value,
             api_key: $('#down-key').value.trim(),
-            filename: $('#down-name').value.trim()
+            filename: $('#down-name').value.trim(),
+            save_to_drive: $('#down-gdrive') ? $('#down-gdrive').checked : false
           })
         });
         const data = await res.json();
