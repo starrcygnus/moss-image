@@ -876,13 +876,19 @@ def download_file_robust(final_url, dest_dir, fname, headers=None):
     global DOWNLOAD_STATE
     UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
     cmd = [
-        "aria2c", "-x", "8", "-s", "8", "-k", "1M", "-c", "--file-allocation=none",
+        "aria2c", "-x", "16", "-s", "16", "-k", "1M", "-c", "--file-allocation=none",
         "--console-log-level=warn", "--summary-interval=1",
         f"--user-agent={UA}",
-        "--header=Referer: https://civitai.com/",
         "--check-certificate=false",
-        "-d", dest_dir, "-o", fname, final_url
     ]
+    if "civitai" in final_url.lower():
+        cmd.append("--header=Referer: https://civitai.com/")
+    if headers:
+        for hk, hv in headers.items():
+            if hk.lower() not in ("user-agent", "referer"):
+                cmd.append(f"--header={hk}: {hv}")
+    cmd.extend(["-d", dest_dir, "-o", fname, final_url])
+
     err_lines = []
     aria_ok = False
     try:
@@ -910,25 +916,73 @@ def download_file_robust(final_url, dest_dir, fname, headers=None):
 
     if not aria_ok:
         out_path = os.path.join(dest_dir, fname)
-        DOWNLOAD_STATE["msg"] = f"Streaming {fname} via direct connection..."
-        req_headers = {"User-Agent": UA, "Referer": "https://civitai.com/"}
+        DOWNLOAD_STATE["msg"] = f"Streaming {fname} via multi-connection fallback..."
+        req_headers = {"User-Agent": UA}
+        if "civitai" in final_url.lower():
+            req_headers["Referer"] = "https://civitai.com/"
         if headers:
             req_headers.update(headers)
-        with requests.get(final_url, headers=req_headers, stream=True, timeout=60) as r:
-            r.raise_for_status()
-            total_len = int(r.headers.get("content-length", 0))
-            dl_bytes = 0
+
+        # Probe content-length and byte-range support for parallel fallback
+        total_len = 0
+        accept_ranges = False
+        try:
+            hr = requests.head(final_url, headers=req_headers, allow_redirects=True, timeout=20)
+            if hr.status_code < 400:
+                total_len = int(hr.headers.get("content-length", 0))
+                accept_ranges = hr.headers.get("accept-ranges", "").lower() == "bytes"
+                final_url = hr.url
+        except Exception:
+            pass
+
+        if accept_ranges and total_len > 16 * 1024 * 1024:
+            from concurrent.futures import ThreadPoolExecutor
+            num_workers = 8
+            part_size = (total_len + num_workers - 1) // num_workers
             with open(out_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
-                    if chunk:
-                        f.write(chunk)
-                        dl_bytes += len(chunk)
-                        if total_len > 0:
-                            pct = int(dl_bytes / total_len * 100)
-                            DOWNLOAD_STATE["percent"] = pct
-                            DOWNLOAD_STATE["msg"] = f"Downloading: {dl_bytes // (1024*1024)}MB / {total_len // (1024*1024)}MB ({pct}%)"
-                        else:
-                            DOWNLOAD_STATE["msg"] = f"Downloading: {dl_bytes // (1024*1024)}MB"
+                f.truncate(total_len)
+
+            progress_lock = threading.Lock()
+            dl_bytes_box = [0]
+
+            def fetch_part(idx):
+                start = idx * part_size
+                end = min(total_len - 1, start + part_size - 1)
+                if start > end:
+                    return
+                p_headers = dict(req_headers)
+                p_headers["Range"] = f"bytes={start}-{end}"
+                with requests.get(final_url, headers=p_headers, stream=True, timeout=60) as r:
+                    r.raise_for_status()
+                    with open(out_path, "r+b") as pf:
+                        pf.seek(start)
+                        for chunk in r.iter_content(chunk_size=2 * 1024 * 1024):
+                            if chunk:
+                                pf.write(chunk)
+                                with progress_lock:
+                                    dl_bytes_box[0] += len(chunk)
+                                    pct = int(dl_bytes_box[0] / total_len * 100)
+                                    DOWNLOAD_STATE["percent"] = pct
+                                    DOWNLOAD_STATE["msg"] = f"Downloading: {dl_bytes_box[0] // (1024*1024)}MB / {total_len // (1024*1024)}MB ({pct}%)"
+
+            with ThreadPoolExecutor(max_workers=num_workers) as pool:
+                list(pool.map(fetch_part, range(num_workers)))
+        else:
+            with requests.get(final_url, headers=req_headers, stream=True, timeout=60) as r:
+                r.raise_for_status()
+                total_len = int(r.headers.get("content-length", 0))
+                dl_bytes = 0
+                with open(out_path, "wb") as f:
+                    for chunk in r.iter_content(chunk_size=4 * 1024 * 1024):
+                        if chunk:
+                            f.write(chunk)
+                            dl_bytes += len(chunk)
+                            if total_len > 0:
+                                pct = int(dl_bytes / total_len * 100)
+                                DOWNLOAD_STATE["percent"] = pct
+                                DOWNLOAD_STATE["msg"] = f"Downloading: {dl_bytes // (1024*1024)}MB / {total_len // (1024*1024)}MB ({pct}%)"
+                            else:
+                                DOWNLOAD_STATE["msg"] = f"Downloading: {dl_bytes // (1024*1024)}MB"
 
 def run_download_task(raw_entry, target_type, civitai_key):
     global DOWNLOAD_STATE
