@@ -1108,7 +1108,37 @@ def run_download_task(raw_entry, target_type, civitai_key):
                     if r_ver.status_code == 200:
                         vdata = r_ver.json()
                         files = vdata.get("files") or []
-                        chosen = next((f for f in files if f.get("primary")), files[0] if files else None)
+                        chosen = None
+                        if "fileId" in qs:
+                            fid = qs["fileId"][0]
+                            chosen = next((f for f in files if str(f.get("id")) == str(fid)), None)
+                        if not chosen and any(k in qs for k in ("fp", "size", "format", "type")):
+                            want_fp = (qs.get("fp") or [None])[0]
+                            want_size = (qs.get("size") or [None])[0]
+                            want_fmt = (qs.get("format") or [None])[0]
+                            want_type = (qs.get("type") or [None])[0]
+                            best, best_score = None, -1
+                            for f in files:
+                                meta = f.get("metadata") or {}
+                                score = 0
+                                if want_fp:
+                                    if str(meta.get("fp", "")).lower() == want_fp.lower():
+                                        score += 4
+                                    elif want_fp.lower() in str(f.get("name", "")).lower():
+                                        score += 3
+                                    else:
+                                        continue
+                                if want_size and str(meta.get("size", "")).lower() == want_size.lower():
+                                    score += 2
+                                if want_fmt and str(meta.get("format", "")).lower() == want_fmt.lower():
+                                    score += 2
+                                if want_type and str(f.get("type", "")).lower() == want_type.lower():
+                                    score += 1
+                                if score > best_score:
+                                    best, best_score = f, score
+                            chosen = best
+                        if not chosen and not (m_dl and any(k in qs for k in ("fileId", "fp"))):
+                            chosen = next((f for f in files if f.get("primary")), files[0] if files else None)
                         if chosen:
                             fname = chosen.get("name")
                             if chosen.get("downloadUrl"):
@@ -1123,7 +1153,7 @@ def run_download_task(raw_entry, target_type, civitai_key):
             resp = requests.get(dl_url, headers=headers, allow_redirects=False, timeout=30)
             if resp.status_code in (301, 302, 303, 307, 308) and "Location" in resp.headers:
                 final_url = resp.headers["Location"]
-                if "civitai.com/login" in final_url:
+                if "/login" in final_url:
                     raise RuntimeError("Civitai requires an API Key for this model. Please enter your Civitai API Key.")
                 if not fname:
                     fname = filename_from_headers(resp.headers, final_url)
