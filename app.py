@@ -1440,7 +1440,7 @@ h3{font-size:13px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px;
         <div style="font-size:11px;color:var(--mut);margin-bottom:12px">Download extra diffusion models or LoRAs directly from Civitai, Hugging Face, or Google Drive into ComfyUI.</div>
 
         <label for="dl-url" style="margin-top:0">Model / LoRA URL or Civitai AIR</label>
-        <input type="text" id="dl-url" placeholder="https://civitai.com/... or urn:air:... or huggingface.co/..." style="font-size:12px;padding:8px">
+        <input type="text" id="dl-url" autocomplete="off" data-bwignore="true" data-1p-ignore="true" data-lpignore="true" spellcheck="false" placeholder="https://civitai.com/... or urn:air:... or huggingface.co/..." style="font-size:12px;padding:8px">
 
         <div class="row" style="margin-top:8px">
           <div>
@@ -1453,7 +1453,7 @@ h3{font-size:13px;color:var(--mut);text-transform:uppercase;letter-spacing:.5px;
           </div>
           <div>
             <label for="dl-key">Civitai Key (optional)</label>
-            <input type="password" id="dl-key" placeholder="API key if restricted" style="font-size:12px;padding:8px">
+            <input type="text" id="dl-key" autocomplete="off" data-bwignore="true" data-1p-ignore="true" data-lpignore="true" spellcheck="false" placeholder="API key if restricted" style="font-size:12px;padding:8px;-webkit-text-security:disc">
           </div>
         </div>
 
