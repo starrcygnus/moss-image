@@ -1102,7 +1102,7 @@ def run_download_task(raw_entry, target_type, civitai_key):
                     version_id = str(versions[0]["id"])
                 dl_url = f"https://civitai.com/api/download/models/{version_id}"
 
-            if version_id and not fname:
+            if version_id:
                 try:
                     r_ver = requests.get(f"https://civitai.com/api/v1/model-versions/{version_id}", headers=headers, timeout=30)
                     if r_ver.status_code == 200:
@@ -1140,7 +1140,8 @@ def run_download_task(raw_entry, target_type, civitai_key):
                         if not chosen and not (m_dl and any(k in qs for k in ("fileId", "fp"))):
                             chosen = next((f for f in files if f.get("primary")), files[0] if files else None)
                         if chosen:
-                            fname = chosen.get("name")
+                            if not fname:
+                                fname = chosen.get("name")
                             if chosen.get("downloadUrl"):
                                 dl_url = chosen["downloadUrl"]
                 except Exception:
