@@ -341,6 +341,275 @@ def embed_png_metadata(img_path, meta_info, final_caption=""):
     except Exception as e:
         print(f"Metadata embedding note: {e}")
 
+def _parse_a1111_parameters(raw_text):
+    res = {
+        "prompt": "", "negative": "", "loras": [],
+        "steps": None, "cfg": None, "sampler": None, "scheduler": None, "seed": None, "checkpoint": None
+    }
+    if not raw_text or not isinstance(raw_text, str):
+        return res
+    text = raw_text.strip()
+    neg_idx = text.find("Negative prompt:")
+    steps_m = re.search(r"(?:^|\n)\s*Steps:\s*\d+", text)
+    steps_idx = steps_m.start() if steps_m else -1
+
+    if neg_idx != -1:
+        res["prompt"] = text[:neg_idx].strip()
+        neg_start = neg_idx + len("Negative prompt:")
+        if steps_idx != -1 and steps_idx > neg_start:
+            res["negative"] = text[neg_start:steps_idx].strip()
+        else:
+            res["negative"] = text[neg_start:].strip()
+    elif steps_idx != -1:
+        res["prompt"] = text[:steps_idx].strip()
+    else:
+        res["prompt"] = text
+
+    # Extract inline <lora:name:strength> tags from prompt
+    lora_seen = set()
+    def _add_lora(name, strength=1.0):
+        name = (name or "").strip()
+        if not name or name.lower() == "none":
+            return
+        try:
+            st = float(strength)
+        except (TypeError, ValueError):
+            st = 1.0
+        key = name.lower()
+        if key not in lora_seen:
+            lora_seen.add(key)
+            res["loras"].append({"name": name, "strength": st})
+
+    for m in re.finditer(r"<lora:([^:>]+):([-\d.]+)(?::[-\d.]+)?>", res["prompt"], re.I):
+        _add_lora(m.group(1), m.group(2))
+    # Strip <lora:...> tags from clean prompt text so Anima doesn't treat them as literal tokens
+    if res["loras"]:
+        res["prompt"] = re.sub(r"\s*<lora:[^>]+>\s*", " ", res["prompt"]).strip(" ,\n")
+
+    if steps_idx != -1:
+        tail = text[steps_idx:].strip()
+        # Extract Anima-style "LoRA N: name (strength)" entries
+        for m in re.finditer(r"LoRA\s*\d+\s*:\s*([^,\(\n]+?)\s*\(([-\d.]+)\)", tail, re.I):
+            _add_lora(m.group(1), m.group(2))
+        # Extract A1111 "Lora hashes: \"name: hash, ...\""
+        m_lh = re.search(r'Lora hashes:\s*"([^"]+)"', tail, re.I)
+        if m_lh:
+            for item in m_lh.group(1).split(","):
+                if ":" in item:
+                    lname = item.split(":", 1)[0].strip()
+                    _add_lora(lname, 1.0)
+
+        def _grab(pattern):
+            m = re.search(pattern, tail, re.I)
+            return m.group(1).strip() if m else None
+
+        s_val = _grab(r"Steps:\s*(\d+)")
+        if s_val: res["steps"] = int(s_val)
+        c_val = _grab(r"CFG scale:\s*([-\d.]+)")
+        if c_val: res["cfg"] = float(c_val)
+        sd_val = _grab(r"Seed:\s*(-?\d+)")
+        if sd_val: res["seed"] = int(sd_val)
+        res["sampler"] = _grab(r"Sampler:\s*([^,\n]+)")
+        res["scheduler"] = _grab(r"Schedule type:\s*([^,\n]+)")
+        res["checkpoint"] = _grab(r"Model:\s*([^,\n]+)")
+
+    return res
+
+def _parse_comfy_api_graph(graph):
+    res = {
+        "prompt": "", "negative": "", "loras": [],
+        "steps": None, "cfg": None, "sampler": None, "scheduler": None, "seed": None, "checkpoint": None
+    }
+    if not isinstance(graph, dict):
+        return res
+
+    def _trace_text(link, depth=0):
+        if depth > 12 or not isinstance(link, list) or not link:
+            return ""
+        nid = str(link[0])
+        node = graph.get(nid)
+        if not isinstance(node, dict):
+            return ""
+        inp = node.get("inputs") or {}
+        for k in ("text", "text_g", "text_l", "prompt", "positive", "string"):
+            v = inp.get(k)
+            if isinstance(v, str) and v.strip():
+                return v.strip()
+            if isinstance(v, list):
+                t = _trace_text(v, depth + 1)
+                if t:
+                    return t
+        for k in ("conditioning", "conditioning_1", "cond"):
+            if isinstance(inp.get(k), list):
+                t = _trace_text(inp[k], depth + 1)
+                if t:
+                    return t
+        return ""
+
+    def _trace_loras(link, acc, depth=0):
+        if depth > 20 or not isinstance(link, list) or not link:
+            return
+        nid = str(link[0])
+        node = graph.get(nid)
+        if not isinstance(node, dict):
+            return
+        ctype = (node.get("class_type") or "").lower()
+        inp = node.get("inputs") or {}
+        if "model" in inp and isinstance(inp["model"], list):
+            _trace_loras(inp["model"], acc, depth + 1)
+        if "lora" in ctype:
+            if isinstance(inp.get("lora_name"), str) and inp["lora_name"] != "None":
+                acc.append({"name": inp["lora_name"], "strength": float(inp.get("strength_model", 1.0))})
+            for k, v in inp.items():
+                if isinstance(v, dict) and v.get("on") and v.get("lora") and v["lora"] != "None":
+                    acc.append({"name": v["lora"], "strength": float(v.get("strength", 1.0))})
+        if "unetloader" in ctype or "checkpointloader" in ctype:
+            ckpt = inp.get("unet_name") or inp.get("ckpt_name")
+            if isinstance(ckpt, str):
+                res["checkpoint"] = ckpt
+
+    samplers = [n for n in graph.values() if isinstance(n, dict) and "sampler" in (n.get("class_type") or "").lower()]
+    if samplers:
+        ks = samplers[0].get("inputs") or {}
+        res["steps"] = ks.get("steps") if isinstance(ks.get("steps"), int) else None
+        res["cfg"] = float(ks["cfg"]) if isinstance(ks.get("cfg"), (int, float)) else None
+        res["sampler"] = ks.get("sampler_name") if isinstance(ks.get("sampler_name"), str) else None
+        res["scheduler"] = ks.get("scheduler") if isinstance(ks.get("scheduler"), str) else None
+        res["seed"] = ks.get("seed") if isinstance(ks.get("seed"), int) else None
+        res["prompt"] = _trace_text(ks.get("positive"))
+        res["negative"] = _trace_text(ks.get("negative"))
+        _trace_loras(ks.get("model"), res["loras"])
+
+    # Fallback if graph uses non-standard nodes or UI-less LoRA nodes
+    if not res["loras"]:
+        for node in graph.values():
+            if not isinstance(node, dict):
+                continue
+            ctype = (node.get("class_type") or "").lower()
+            inp = node.get("inputs") or {}
+            if "lora" in ctype:
+                if isinstance(inp.get("lora_name"), str) and inp["lora_name"] != "None":
+                    res["loras"].append({"name": inp["lora_name"], "strength": float(inp.get("strength_model", 1.0))})
+                for k, v in inp.items():
+                    if isinstance(v, dict) and v.get("on") and v.get("lora") and v["lora"] != "None":
+                        res["loras"].append({"name": v["lora"], "strength": float(v.get("strength", 1.0))})
+    return res
+
+def extract_image_prompt_metadata(img_path):
+    empty = {
+        "found": False, "source": "", "prompt": "", "negative": "", "loras": [],
+        "steps": None, "cfg": None, "sampler": None, "scheduler": None, "seed": None, "checkpoint": None, "raw": ""
+    }
+    if not img_path or not os.path.isfile(img_path):
+        return empty
+    try:
+        from PIL import Image
+        with Image.open(img_path) as im:
+            info = dict(getattr(im, "info", {}) or {})
+            exif_comment = ""
+            try:
+                exif = im.getexif()
+                if exif:
+                    exif_ifd = exif.get_ifd(0x8769) or {}
+                    uc = exif_ifd.get(0x9286) or exif.get(0x9286) or exif.get(0x010E)
+                    if isinstance(uc, bytes):
+                        if uc.startswith(b"UNICODE\x00"):
+                            raw_b = uc[8:]
+                            # Try UTF-16BE then UTF-16LE
+                            try:
+                                exif_comment = raw_b.decode("utf-16-be")
+                            except Exception:
+                                exif_comment = raw_b.decode("utf-16-le", errors="ignore")
+                        elif uc.startswith(b"ASCII\x00\x00\x00"):
+                            exif_comment = uc[8:].decode("utf-8", errors="ignore")
+                        else:
+                            exif_comment = uc.decode("utf-8", errors="ignore")
+                    elif isinstance(uc, str):
+                        exif_comment = uc
+            except Exception:
+                pass
+
+        # 1) A1111 / Forge / Anima PNG "parameters" or EXIF UserComment
+        param_text = info.get("parameters") or (exif_comment if "Steps:" in exif_comment or "Negative prompt:" in exif_comment else "")
+        if isinstance(param_text, str) and param_text.strip():
+            parsed = _parse_a1111_parameters(param_text)
+            if parsed["prompt"] or parsed["loras"]:
+                parsed["found"] = True
+                parsed["source"] = "PNG parameters" if info.get("parameters") else "EXIF parameters"
+                parsed["raw"] = param_text
+                # Merge LoRAs from API workflow JSON if parameters didn't list them
+                if not parsed["loras"]:
+                    for jkey in ("prompt", "workflow"):
+                        jval = info.get(jkey)
+                        if isinstance(jval, str) and jval.strip().startswith("{"):
+                            try:
+                                g = json.loads(jval)
+                                if "nodes" not in g:
+                                    gp = _parse_comfy_api_graph(g)
+                                    if gp["loras"]:
+                                        parsed["loras"] = gp["loras"]
+                                        break
+                            except Exception:
+                                pass
+                return parsed
+
+        # 2) ComfyUI API JSON ("prompt" or API-style "workflow")
+        for jkey in ("prompt", "workflow"):
+            jval = info.get(jkey)
+            if isinstance(jval, str) and jval.strip().startswith("{"):
+                try:
+                    g = json.loads(jval)
+                    if isinstance(g, dict) and "nodes" not in g:
+                        parsed = _parse_comfy_api_graph(g)
+                        if parsed["prompt"] or parsed["loras"]:
+                            parsed["found"] = True
+                            parsed["source"] = f"ComfyUI {jkey}"
+                            parsed["raw"] = jval[:2000]
+                            return parsed
+                except Exception:
+                    pass
+
+        # 3) NovelAI JSON Comment + Description
+        comment = info.get("Comment")
+        if isinstance(comment, str) and comment.strip().startswith("{"):
+            try:
+                cdata = json.loads(comment)
+                if isinstance(cdata, dict) and ("prompt" in cdata or "uc" in cdata):
+                    res = dict(empty)
+                    res["found"] = True
+                    res["source"] = "NovelAI"
+                    res["prompt"] = (cdata.get("prompt") or info.get("Description") or "").strip()
+                    res["negative"] = (cdata.get("uc") or "").strip()
+                    res["steps"] = cdata.get("steps")
+                    res["cfg"] = cdata.get("scale")
+                    res["seed"] = cdata.get("seed")
+                    res["sampler"] = cdata.get("sampler")
+                    res["raw"] = comment
+                    return res
+            except Exception:
+                pass
+
+        # 4) Generic text tags fallback (caption / Description / Comment / EXIF)
+        for k in ("caption", "Description", "Comment"):
+            val = info.get(k)
+            if isinstance(val, str) and val.strip():
+                res = dict(empty)
+                res["found"] = True
+                res["source"] = k
+                res["prompt"] = val.strip()
+                res["raw"] = val.strip()
+                return res
+        if exif_comment.strip():
+            res = dict(empty)
+            res["found"] = True
+            res["source"] = "EXIF"
+            res["prompt"] = exif_comment.strip()
+            res["raw"] = exif_comment.strip()
+            return res
+    except Exception as e:
+        print(f"Read metadata note: {e}")
+    return empty
+
 # ---------------------------------------------------------------------------
 # Load Template Workflow
 # ---------------------------------------------------------------------------
@@ -1454,6 +1723,30 @@ def upload_file():
     f.save(out_path)
     return jsonify(filename=safe_name)
 
+@app.post("/api/read_image_prompt")
+def read_image_prompt_endpoint():
+    p = request.get_json(force=True, silent=True) or {}
+    fn = os.path.basename((p.get("filename") or "").strip())
+    if not fn:
+        return jsonify(error="No image specified"), 400
+    candidates = [
+        os.path.join(COMFY_DIR, "input", fn),
+        os.path.join(COMFY_DIR, "output", fn),
+    ]
+    img_path = next((c for c in candidates if os.path.isfile(c)), None)
+    if not img_path:
+        for base in (os.path.join(COMFY_DIR, "input"), os.path.join(COMFY_DIR, "output")):
+            if os.path.isdir(base):
+                for root, _, files in os.walk(base):
+                    if fn in files:
+                        img_path = os.path.join(root, fn)
+                        break
+            if img_path:
+                break
+    if not img_path:
+        return jsonify(error="Image file not found on server"), 404
+    return jsonify(extract_image_prompt_metadata(img_path))
+
 @app.post("/api/tag_image")
 def tag_image_endpoint():
     p = request.get_json(force=True, silent=True) or {}
@@ -2116,8 +2409,10 @@ INDEX_HTML = r'''<!doctype html>
           </div>
           <div class="row" style="margin-top:8px;">
             <button class="btn-tag" onclick="tagCurrentImage()" style="flex:1;">🏷️ Auto-Tag Reference</button>
+            <button class="btn-sub" onclick="inspectImagePrompt(gState.inputImage, 'i2i', true)" title="Read embedded prompt & LoRAs from image">📄 Read Prompt</button>
             <button class="btn-sub" onclick="clearI2I()">✕ Clear</button>
           </div>
+          <div id="i2i-meta-box" style="display:none; margin-top:8px; background:var(--bg-card); border:1px solid var(--border); border-radius:6px; padding:8px; font-size:11px;"></div>
           <div class="row" style="margin-top:8px;">
             <div class="col">
               <label>Denoise Strength: <span id="val-denoise">0.65</span></label>
@@ -2143,6 +2438,7 @@ INDEX_HTML = r'''<!doctype html>
             <div id="tagger-placeholder">🏷️ Drop anime image to extract Danbooru tags</div>
             <img id="tagger-preview" style="max-height:140px; display:none; margin:0 auto; border-radius:4px;">
           </div>
+          <div id="tagger-meta-box" style="display:none; margin-top:8px; background:var(--bg-card); border:1px solid var(--border); border-radius:6px; padding:8px; font-size:11px;"></div>
           <div class="row" style="margin-top:8px;">
             <div class="col">
               <label>General Threshold: <span id="val-gth">0.35</span></label>
@@ -2153,7 +2449,10 @@ INDEX_HTML = r'''<!doctype html>
               <input type="range" id="tagger-cth" min="0.20" max="0.95" step="0.05" value="0.75" oninput="$('#val-cth').innerText=this.value">
             </div>
           </div>
-          <button class="btn-main" id="btn-run-tagger" onclick="runStandaloneTagger()" style="margin-top:8px; width:100%;">⚡ Extract Tags with WD-EVA02</button>
+          <div class="row" style="margin-top:8px;">
+            <button class="btn-main" id="btn-run-tagger" onclick="runStandaloneTagger()" style="flex:1;">⚡ Extract Tags with WD-EVA02</button>
+            <button class="btn-sub" onclick="inspectImagePrompt(gState.taggerImage, 'tagger', true)" title="Read embedded prompt & LoRAs from image">📄 Read Prompt</button>
+          </div>
           <div id="tagger-results" style="margin-top:10px; display:none;">
             <div class="box-header" style="margin-bottom:6px;">
               <span>Extracted Tags:</span>
@@ -2715,6 +3014,187 @@ INDEX_HTML = r'''<!doctype html>
       }
     }
 
+    gState.extractedMeta = { i2i: null, tagger: null };
+
+    function _escHtml(s) {
+      return (s || '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+    }
+
+    function matchInstalledLora(rawName) {
+      if (!rawName) return null;
+      const avail = (gState.loras || []).filter(l => l && l !== 'None');
+      if (avail.includes(rawName)) return rawName;
+      const cleanRaw = rawName.replace(/\\/g, '/').split('/').pop().replace(/\.(safetensors|pt|ckpt)$/i, '').toLowerCase();
+      for (const l of avail) {
+        const base = l.replace(/\\/g, '/').split('/').pop().replace(/\.(safetensors|pt|ckpt)$/i, '').toLowerCase();
+        if (base === cleanRaw) return l;
+      }
+      const norm = s => s.replace(/[\s_-]+/g, '');
+      for (const l of avail) {
+        const base = l.replace(/\\/g, '/').split('/').pop().replace(/\.(safetensors|pt|ckpt)$/i, '').toLowerCase();
+        if (norm(base) === norm(cleanRaw)) return l;
+      }
+      return null;
+    }
+
+    async function inspectImagePrompt(filename, prefix, showMissingToast = true) {
+      if (!filename) {
+        if (showMissingToast) showToast('Please upload an image first.', 'error');
+        return;
+      }
+      try {
+        const res = await fetch('/api/read_image_prompt', {
+          method: 'POST',
+          headers: {'Content-Type': 'application/json'},
+          body: JSON.stringify({ filename })
+        });
+        const data = await res.json();
+        if (!res.ok || data.error) throw new Error(data.error || 'Read failed');
+        gState.extractedMeta[prefix] = data;
+        renderImageMetaBox(prefix, data);
+        if (!data.found && showMissingToast) {
+          showToast('No embedded prompt or LoRA metadata found in this image.', 'info', 3000);
+        } else if (data.found && showMissingToast) {
+          showToast(`Found embedded metadata (${data.source || 'PNG'})!`, 'success', 2000);
+        }
+      } catch (e) {
+        if (showMissingToast) showToast('Metadata read error: ' + e.message, 'error');
+      }
+    }
+
+    function renderImageMetaBox(prefix, meta) {
+      const box = $(`#${prefix}-meta-box`);
+      if (!box) return;
+      if (!meta || !meta.found) {
+        box.style.display = 'none';
+        box.innerHTML = '';
+        return;
+      }
+      const loras = meta.loras || [];
+      let loraHtml = '';
+      if (loras.length > 0) {
+        const badges = loras.map(l => {
+          const matched = matchInstalledLora(l.name);
+          const color = matched ? 'var(--success)' : 'var(--text-muted)';
+          const label = matched ? `✓ ${matched}` : `? ${l.name}`;
+          return `<span style="padding:1px 6px; border-radius:4px; border:1px solid ${color}; color:${color}; font-size:10px;">${_escHtml(label)} (${l.strength})</span>`;
+        }).join(' ');
+        loraHtml = `<div style="margin-top:5px; display:flex; flex-wrap:wrap; gap:4px; align-items:center;"><span style="color:var(--text-muted); font-size:10px;">LoRAs:</span> ${badges}</div>`;
+      }
+
+      const paramBits = [];
+      if (meta.steps) paramBits.push(`Steps: ${meta.steps}`);
+      if (meta.cfg) paramBits.push(`CFG: ${meta.cfg}`);
+      if (meta.sampler) paramBits.push(`${meta.sampler}`);
+      if (meta.seed !== null && meta.seed !== undefined) paramBits.push(`Seed: ${meta.seed}`);
+      const paramHtml = paramBits.length ? `<div style="margin-top:4px; color:var(--text-muted); font-size:10px;">${_escHtml(paramBits.join(' • '))}</div>` : '';
+
+      const promptPreview = _escHtml((meta.prompt || '').slice(0, 220)) + ((meta.prompt || '').length > 220 ? '…' : '');
+      const negPreview = meta.negative ? `<div style="margin-top:3px; color:var(--text-muted); font-size:10px;"><b>Neg:</b> ${_escHtml(meta.negative.slice(0, 120))}${meta.negative.length > 120 ? '…' : ''}</div>` : '';
+
+      box.style.display = 'block';
+      box.innerHTML = `
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:4px;">
+          <span style="font-weight:700; color:var(--accent); font-size:11px;">📄 Embedded Info (${_escHtml(meta.source || 'Metadata')})</span>
+          <button type="button" class="btn-sub" style="padding:1px 5px; font-size:10px;" onclick="$('#${prefix}-meta-box').style.display='none'">✕</button>
+        </div>
+        <div style="color:var(--text); line-height:1.35; word-break:break-word; max-height:72px; overflow-y:auto;">${promptPreview || '<i>(No positive prompt text)</i>'}</div>
+        ${negPreview}
+        ${loraHtml}
+        ${paramHtml}
+        <div class="row" style="margin-top:6px; flex-wrap:wrap; gap:4px;">
+          <button type="button" class="btn-sub" onclick="copyImagePrompt('${prefix}')">📋 Copy Prompt</button>
+          <button type="button" class="btn-sub" style="border-color:var(--accent);" onclick="applyImageMeta('${prefix}', 'prompt')">✨ Use Prompt</button>
+          ${loras.length ? `<button type="button" class="btn-sub" style="border-color:var(--success);" onclick="applyImageMeta('${prefix}', 'loras')">🎛️ + LoRAs</button>` : ''}
+          <button type="button" class="btn-sub" onclick="applyImageMeta('${prefix}', 'all')">⚙️ Apply All</button>
+        </div>
+      `;
+    }
+
+    function copyImagePrompt(prefix) {
+      const meta = gState.extractedMeta[prefix];
+      if (!meta || !meta.prompt) return showToast('No prompt text to copy.', 'error');
+      navigator.clipboard.writeText(meta.prompt);
+      showToast('Copied embedded prompt to clipboard!', 'success');
+    }
+
+    async function applyImageMeta(prefix, mode) {
+      const meta = gState.extractedMeta[prefix];
+      if (!meta || !meta.found) return;
+
+      if (meta.prompt) $('#prompt').value = meta.prompt;
+      if (meta.negative) $('#negative').value = meta.negative;
+
+      if (mode === 'loras' || mode === 'all') {
+        const loras = meta.loras || [];
+        const missing = [];
+        let slot = 1;
+        for (let i = 1; i <= 6; i++) {
+          gState.slotTriggers[i] = [];
+          const sel = $(`#lora-${i}-name`);
+          const chk = $(`#lora-${i}-on`);
+          const num = $(`#lora-${i}-num`);
+          const rng = $(`#lora-${i}-str`);
+          if (sel) sel.value = 'None';
+          if (chk) chk.checked = true;
+          if (num) num.value = 1.0;
+          if (rng) rng.value = 1.0;
+          renderSlotTriggerChips(i, 'None', null);
+        }
+        for (const l of loras) {
+          if (slot > 6) break;
+          const matched = matchInstalledLora(l.name);
+          if (matched) {
+            const curSlot = slot;
+            $(`#lora-${curSlot}-name`).value = matched;
+            $(`#lora-${curSlot}-on`).checked = true;
+            const st = isNaN(parseFloat(l.strength)) ? 1.0 : parseFloat(l.strength);
+            $(`#lora-${curSlot}-num`).value = st;
+            $(`#lora-${curSlot}-str`).value = Math.max(-2.0, Math.min(5.0, st));
+            // Silently fetch trigger chips without altering the applied prompt
+            fetch(`/api/lora_triggers?name=${encodeURIComponent(matched)}`)
+              .then(r => r.json()).then(d => renderSlotTriggerChips(curSlot, matched, d)).catch(() => {});
+            slot++;
+          } else {
+            missing.push(l.name);
+          }
+        }
+        updateLoraBadge();
+        if (missing.length) {
+          showToast(`LoRA not found locally: ${missing.join(', ')}`, 'info', 4000);
+        }
+      }
+
+      if (mode === 'all') {
+        if (meta.steps) {
+          const stp = Math.max(4, Math.min(60, parseInt(meta.steps)));
+          $('#steps').value = stp;
+          $('#val-steps').innerText = stp;
+        }
+        if (meta.cfg) {
+          const cfg = Math.max(1.0, Math.min(10.0, parseFloat(meta.cfg)));
+          $('#cfg').value = cfg;
+          $('#val-cfg').innerText = cfg;
+        }
+        if (meta.sampler && [...$('#sampler').options].some(o => o.value === meta.sampler)) {
+          $('#sampler').value = meta.sampler;
+        }
+        if (meta.scheduler && [...$('#scheduler').options].some(o => o.value === meta.scheduler)) {
+          $('#scheduler').value = meta.scheduler;
+        }
+        if (meta.seed !== null && meta.seed !== undefined) {
+          $('#seed').value = meta.seed;
+        }
+      }
+
+      showToast(
+        mode === 'all' ? 'Applied prompt, LoRAs & settings!' :
+        mode === 'loras' ? 'Applied prompt & matched LoRAs!' :
+        'Applied prompt from image!',
+        'success'
+      );
+    }
+
     // Reference Image Upload
     async function handleFileSelect(file) {
       if (!file) return;
@@ -2727,11 +3207,14 @@ INDEX_HTML = r'''<!doctype html>
         $('#i2i-placeholder').style.display = 'none';
         $('#i2i-preview').src = `/api/view?filename=${data.filename}&type=input`;
         $('#i2i-preview').style.display = 'block';
+        inspectImagePrompt(data.filename, 'i2i', false);
       }
     }
 
     function clearI2I() {
       gState.inputImage = null;
+      gState.extractedMeta.i2i = null;
+      renderImageMetaBox('i2i', null);
       $('#i2i-preview').style.display = 'none';
       $('#i2i-placeholder').style.display = 'block';
       $('#i2i-file').value = '';
@@ -2749,6 +3232,7 @@ INDEX_HTML = r'''<!doctype html>
         $('#tagger-placeholder').style.display = 'none';
         $('#tagger-preview').src = `/api/view?filename=${data.filename}&type=input`;
         $('#tagger-preview').style.display = 'block';
+        inspectImagePrompt(data.filename, 'tagger', false);
       }
     }
 
