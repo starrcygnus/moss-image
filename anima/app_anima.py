@@ -1952,11 +1952,15 @@ INDEX_HTML = r'''<!doctype html>
     }
     .controls-scroll {
       flex: 1;
+      min-height: 0;
       overflow-y: auto;
       padding: 14px 16px 32px 16px;
       display: flex;
       flex-direction: column;
       gap: 12px;
+    }
+    .controls-scroll > * {
+      flex-shrink: 0;
     }
     .prompt-box {
       display: flex;
@@ -2010,6 +2014,7 @@ INDEX_HTML = r'''<!doctype html>
       border-radius: var(--radius);
       background: var(--bg-card);
       overflow: hidden;
+      flex-shrink: 0;
     }
     .accordion-header {
       padding: 8px 10px;
@@ -2328,7 +2333,7 @@ INDEX_HTML = r'''<!doctype html>
             <span>Negative Prompt</span>
             <span>▾</span>
           </div>
-          <div class="accordion-body" style="display:none;">
+          <div class="accordion-body" style="display:flex;">
             <textarea id="negative" rows="2">worst quality, low quality, bad anatomy, bad hands, missing fingers, extra digits, signature, watermark</textarea>
           </div>
         </div>
